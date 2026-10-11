@@ -42,6 +42,110 @@ func ReadInitialTLSRecord(conn net.Conn) ([]byte, error) {
 	return record, nil
 }
 
+// ParseClientHelloALPN returns the ALPN protocol list advertised in a TLS
+// ClientHello record. It returns nil when the extension is absent or the
+// record cannot be parsed.
+func ParseClientHelloALPN(data []byte) []string {
+	alpn, err := parseClientHelloALPN(data)
+	if err != nil {
+		return nil
+	}
+	return alpn
+}
+
+func parseClientHelloALPN(data []byte) ([]string, error) {
+	const (
+		handshakeHeaderLen       = 4
+		handshakeTypeClientHello = 0x01
+		extTypeALPN              = 0x0010
+	)
+
+	if len(data) < TlsRecordHeaderLen {
+		return nil, errors.New("TLS record too short")
+	}
+	recordLen := int(binary.BigEndian.Uint16(data[3:5]))
+	if len(data) < TlsRecordHeaderLen+recordLen {
+		return nil, errors.New("record length exceeds data size")
+	}
+	offset := TlsRecordHeaderLen
+	if data[offset] != handshakeTypeClientHello {
+		return nil, fmt.Errorf("not a ClientHello handshake (type=%d)", data[offset])
+	}
+	if offset+handshakeHeaderLen > len(data) {
+		return nil, errors.New("handshake header exceeds data")
+	}
+	handshakeLen := int(uint32(data[offset+1])<<16 | uint32(data[offset+2])<<8 | uint32(data[offset+3]))
+	if handshakeLen+handshakeHeaderLen > recordLen {
+		return nil, errors.New("handshake length exceeds record length")
+	}
+	offset += handshakeHeaderLen
+
+	// legacy_version(2) + random(32)
+	if offset+2+32+1 > len(data) {
+		return nil, errors.New("ClientHello too short")
+	}
+	offset += 2 + 32
+	sessionIDLen := int(data[offset])
+	offset++
+	if offset+sessionIDLen+2 > len(data) {
+		return nil, errors.New("session_id exceeds data")
+	}
+	offset += sessionIDLen
+	csLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	if offset+csLen+1 > len(data) {
+		return nil, errors.New("cipher_suites exceed data")
+	}
+	offset += csLen
+	compMethodsLen := int(data[offset])
+	offset++
+	if offset+compMethodsLen+2 > len(data) {
+		return nil, errors.New("compression_methods exceed data")
+	}
+	offset += compMethodsLen
+
+	extTotalLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+	offset += 2
+	extensionsEnd := offset + extTotalLen
+	if extensionsEnd > len(data) {
+		extensionsEnd = len(data)
+	}
+
+	for offset+4 <= extensionsEnd {
+		extType := binary.BigEndian.Uint16(data[offset : offset+2])
+		extLen := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+		extDataStart := offset + 4
+		extDataEnd := extDataStart + extLen
+		if extDataEnd > extensionsEnd {
+			break
+		}
+		if extType == extTypeALPN {
+			if extLen < 2 {
+				return nil, errors.New("malformed ALPN extension")
+			}
+			listLen := int(binary.BigEndian.Uint16(data[extDataStart : extDataStart+2]))
+			if listLen+2 > extLen {
+				return nil, errors.New("ALPN list length exceeds extension")
+			}
+			cursor := extDataStart + 2
+			listEnd := cursor + listLen
+			var out []string
+			for cursor < listEnd {
+				nameLen := int(data[cursor])
+				cursor++
+				if cursor+nameLen > listEnd {
+					break
+				}
+				out = append(out, string(data[cursor:cursor+nameLen]))
+				cursor += nameLen
+			}
+			return out, nil
+		}
+		offset = extDataEnd
+	}
+	return nil, nil
+}
+
 func FindLastDot(data []byte, sniPos, sniLen int) (offset int, found bool) {
 	for i := sniPos + sniLen; i >= sniPos; i-- {
 		if data[i] == '.' {

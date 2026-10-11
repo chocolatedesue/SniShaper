@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -26,9 +27,10 @@ import (
 	utls "github.com/refraction-networking/utls"
 
 	"snishaper/common"
+	"snishaper/pkg/tlsfrag"
 )
 
-func (p *ProxyServer) handleMITM(clientConn net.Conn, host string, rule Rule, dialCandidates []string, initialDialAddr string) {
+func (p *ProxyServer) handleMITM(clientConn net.Conn, host, targetAddr string, rule Rule, dialCandidates []string, initialDialAddr string) {
 	defer func() {
 		if r := recover(); r != nil {
 			p.tracef("[MITM] Panic: %v", r)
@@ -40,15 +42,19 @@ func (p *ProxyServer) handleMITM(clientConn net.Conn, host string, rule Rule, di
 
 	if p.certGenerator == nil {
 		p.tracef("[MITM] No cert generator, falling back to direct")
-		p.directTunnel(clientConn, clientConn)
+		if !p.relayDirectFallback(clientConn, nil, host, targetAddr, rule, "mitm unavailable: no cert generator") {
+			clientConn.Close()
+		}
 		return
 	}
 
 	caCert := p.certGenerator.GetCACert()
 	caKey := p.certGenerator.GetCAKey()
 	if caCert == nil || caKey == nil {
-		p.tracef("[MITM] CA cert/key not available")
-		clientConn.Close()
+		p.tracef("[MITM] CA cert/key not available, falling back to direct")
+		if !p.relayDirectFallback(clientConn, nil, host, targetAddr, rule, "mitm unavailable: no CA") {
+			clientConn.Close()
+		}
 		return
 	}
 
@@ -63,48 +69,45 @@ func (p *ProxyServer) handleMITM(clientConn net.Conn, host string, rule Rule, di
 		orderedCandidates = append(orderedCandidates, c)
 	}
 
-	var (
-		upstreamRW       net.Conn
-		upstreamProtocol string
-		upstreamErr      error
-		dialOnce         sync.Once
-	)
+	// Pre-flight: read the client's ClientHello once. It is needed both to pick
+	// the upstream ALPN and to replay the handshake verbatim if we have to
+	// degrade to a raw direct tunnel. Doing this before tls.Server starts means
+	// no alert bytes are ever written to the client on the failure path.
+	clientHello, err := tlsfrag.ReadInitialTLSRecord(clientConn)
+	if err != nil {
+		p.tracef("[MITM] Failed to read client ClientHello for %s: %v", host, err)
+		clientConn.Close()
+		return
+	}
+	replayConn := &bufferedReadConn{
+		Conn:   clientConn,
+		reader: io.MultiReader(bytes.NewReader(clientHello), clientConn),
+	}
+
+	clientALPNs := tlsfrag.ParseClientHelloALPN(clientHello)
+	initialALPN := chooseInitialALPN(clientALPNs)
+	p.tracef("[MITM] Client supported ALPNs: %v, selected initialALPN: %s", clientALPNs, initialALPN)
+	p.tracef("[MITM] Establishing upstream via candidates=%v", orderedCandidates)
+
+	upstreamRW, upstreamProtocol, upstreamErr := p.establishUpstreamConn(host, rule, orderedCandidates, initialALPN)
+	if upstreamErr != nil {
+		p.tracef("[MITM] Upstream handshake failed for %s: %v; attempting direct fallback", host, upstreamErr)
+		if !p.relayDirectFallback(clientConn, clientHello, host, targetAddr, rule, "mitm upstream handshake failed") {
+			p.tracef("[MITM] Direct fallback failed for %s", host)
+			clientConn.Close()
+		}
+		return
+	}
+	defer func() {
+		if upstreamRW != nil {
+			upstreamRW.Close()
+		}
+	}()
+
+	p.tracef("[MITM] Upstream negotiated protocol: %s", upstreamProtocol)
 
 	tlsConfig := &tls.Config{
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			dialOnce.Do(func() {
-				initialALPN := "h2_h1"
-				if len(hello.SupportedProtos) > 0 {
-					hasH2 := false
-					for _, proto := range hello.SupportedProtos {
-						if proto == "h2" {
-							hasH2 = true
-							break
-						}
-					}
-					if !hasH2 {
-						initialALPN = "http/1.1"
-					}
-				} else {
-					initialALPN = "http/1.1"
-				}
-
-				p.tracef("[MITM] Client supported ALPNs: %v, selected initialALPN: %s", hello.SupportedProtos, initialALPN)
-				p.tracef("[MITM] Establishing upstream via candidates=%v", orderedCandidates)
-				upstreamRW, upstreamProtocol, upstreamErr = p.establishUpstreamConn(host, rule, orderedCandidates, initialALPN)
-			})
-
-			if upstreamErr != nil {
-				p.tracef("[MITM] Failed to establish upstream in callback: %v", upstreamErr)
-				return nil, upstreamErr
-			}
-
-			if upstreamRW == nil {
-				return nil, fmt.Errorf("no usable upstream connection established")
-			}
-
-			p.tracef("[MITM] Upstream negotiated protocol: %s", upstreamProtocol)
-
 			clientSNI := normalizeHost(hello.ServerName)
 			if clientSNI != "" && host != "" && clientSNI != host {
 				log.Printf("[MITM] ClientHello SNI mismatch: connect_host=%s client_sni=%s remote=%s", host, clientSNI, hello.Conn.RemoteAddr())
@@ -140,25 +143,30 @@ func (p *ProxyServer) handleMITM(clientConn net.Conn, host string, rule Rule, di
 		},
 	}
 
-	clientTls := tls.Server(clientConn, tlsConfig)
+	clientTls := tls.Server(replayConn, tlsConfig)
 	if err := clientTls.Handshake(); err != nil {
+		// The upstream is already established; a failure here is a client-side
+		// abort, not an upstream fallback case.
 		p.tracef("[MITM] Client TLS handshake failed: %v", err)
 		clientConn.Close()
-		if upstreamRW != nil {
-			upstreamRW.Close()
-		}
 		return
 	}
-	defer func() {
-		if upstreamRW != nil {
-			upstreamRW.Close()
-		}
-	}()
 
 	clientALPN := clientTls.ConnectionState().NegotiatedProtocol
 	p.tracef("[MITM] Client ALPN: %s, Upstream Protocol: %s", clientALPN, upstreamProtocol)
 
 	p.directTunnel(clientTls, upstreamRW)
+}
+
+// chooseInitialALPN maps the client's advertised ALPN list to the value
+// establishUpstreamConn expects for its own upstream handshake.
+func chooseInitialALPN(supported []string) string {
+	for _, proto := range supported {
+		if proto == "h2" {
+			return "h2_h1"
+		}
+	}
+	return "http/1.1"
 }
 
 func (p *ProxyServer) generateCert(host string, caCert *x509.Certificate, caKey interface{}) (*tls.Certificate, error) {

@@ -161,8 +161,11 @@ func (p *ProxyServer) handleSocks5Connect(ctx context.Context, writer io.Writer,
 
 	if err := p.dialUpstream(cr); err != nil {
 		p.tracef("[SOCKS5] upstream connect failed: %v", err)
-		socks5.SendReply(writer, statute.RepHostUnreachable, req.LocalAddr)
-		return err
+		if !p.fallbackDialToDirect(cr, "upstream dial failed") {
+			socks5.SendReply(writer, statute.RepHostUnreachable, req.LocalAddr)
+			return err
+		}
+		p.tracef("[SOCKS5] fallback to direct succeeded for %s via %s", cr.targetHost, cr.dialAddr)
 	}
 	defer cr.conn.Close()
 
@@ -173,13 +176,18 @@ func (p *ProxyServer) handleSocks5Connect(ctx context.Context, writer io.Writer,
 
 	switch cr.effectiveMode {
 	case "mitm":
+		// handleMITM establishes its own upstream TLS connection.
+		if cr.conn != nil {
+			cr.conn.Close()
+			cr.conn = nil
+		}
 		hijackConn := &socks5HijackConn{
 			Conn:   clientConn,
 			reader: req.Reader,
 			writer: writer,
 		}
 		_ = hijackConn.SetDeadline(time.Time{})
-		p.handleMITM(hijackConn, cr.targetHost, cr.rule, cr.dialCandidates, cr.dialAddr)
+		p.handleMITM(hijackConn, cr.targetHost, cr.targetAddr, cr.rule, cr.dialCandidates, cr.dialAddr)
 	case "tls-rf":
 		hijackConn := &socks5HijackConn{
 			Conn:   clientConn,
@@ -187,7 +195,7 @@ func (p *ProxyServer) handleSocks5Connect(ctx context.Context, writer io.Writer,
 			writer: writer,
 		}
 		_ = hijackConn.SetDeadline(time.Time{})
-		p.handleTLSFragment(hijackConn, cr.conn, cr.targetHost, cr.rule)
+		p.handleTLSFragment(hijackConn, cr.conn, cr.targetHost, cr.targetAddr, cr.rule)
 	default:
 		p.handleTransparent(clientConn, cr.conn, cr.targetHost, cr.rule)
 	}

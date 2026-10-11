@@ -35,6 +35,7 @@ type RuleManager struct {
 	nat64Profiles                 []NAT64Profile
 	autoRouter                    *AutoRouter
 	autoRoutingConfig             AutoRoutingConfig
+	directFallback                DirectFallbackConfig
 	mu                            sync.RWMutex
 	routeEventCallback            func(domain, mode string)
 	onConfigSaved                 func()
@@ -321,6 +322,7 @@ func (rm *RuleManager) loadSettingsConfig() error {
 	}
 
 	rm.autoRoutingConfig = config.AutoRouting
+	rm.directFallback = config.DirectFallback
 	if config.Language != "" {
 		rm.language = config.Language
 	}
@@ -868,6 +870,7 @@ func (rm *RuleManager) saveSettingsConfig() error {
 		AutoUpdateRules:               &autoUpdateRules,
 		CloudflareConfig:           cloudflareConfig,
 		AutoRouting:                rm.autoRoutingConfig,
+		DirectFallback:             rm.directFallback,
 		TUN:                        tunConfig,
 		Language:                   rm.language,
 		Theme:                      rm.theme,
@@ -1008,6 +1011,19 @@ func (r *RuleManager) UpdateECHProfileConfig(profileID string, configBytes []byt
 
 	log.Printf("[RuleManager] ECH Profile %s updated via sync", profileID)
 	return r.saveRulesConfig()
+}
+
+func (rm *RuleManager) GetDirectFallbackConfig() DirectFallbackConfig {
+	rm.mu.RLock()
+	defer rm.mu.RUnlock()
+	return rm.directFallback
+}
+
+func (rm *RuleManager) SetDirectFallbackConfig(cfg DirectFallbackConfig) error {
+	rm.mu.Lock()
+	rm.directFallback = cfg
+	rm.mu.Unlock()
+	return rm.saveSettingsConfig()
 }
 
 func (rm *RuleManager) GetAutoRoutingConfig() AutoRoutingConfig {

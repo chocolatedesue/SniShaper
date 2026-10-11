@@ -161,6 +161,7 @@ type SettingsConfig struct {
 	AutoEnableSysProxyOnAutoStart *bool             `json:"auto_enable_sysproxy_on_auto_start,omitempty"`
 	AutoUpdateRules               *bool             `json:"auto_update_rules,omitempty"`
 	AutoRouting                   AutoRoutingConfig `json:"auto_routing,omitempty"`
+	DirectFallback                DirectFallbackConfig `json:"direct_fallback,omitempty"`
 	TUN                           TUNConfig         `json:"tun,omitempty"`
 	Language                      string            `json:"language,omitempty"`
 	Theme                         string            `json:"theme,omitempty"`
@@ -277,6 +278,8 @@ type ProxyServer struct {
 
 	tunMode     bool
 	ifaceConfig netiface.Config
+
+	fallbackTracker fallbackTracker
 }
 
 type dohProxyAdapter struct {

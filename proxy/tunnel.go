@@ -104,9 +104,14 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, req *http.Request, ru
 	}
 
 	if err := p.dialUpstream(cr); err != nil {
-		http.Error(w, "Failed to connect to upstream", http.StatusBadGateway)
 		p.tracef("[Connect] All upstream connect attempts failed: %v, error: %v", cr.dialCandidates, err)
-		return
+		// Degrade to a plain direct connection to the real target instead of
+		// failing the request outright.
+		if !p.fallbackDialToDirect(cr, "upstream dial failed") {
+			http.Error(w, "Failed to connect to upstream", http.StatusBadGateway)
+			return
+		}
+		p.tracef("[Connect] Fallback to direct succeeded for %s via %s", cr.targetHost, cr.dialAddr)
 	}
 
 	hijacker, ok := w.(http.Hijacker)
@@ -140,9 +145,15 @@ func (p *ProxyServer) handleConnect(w http.ResponseWriter, req *http.Request, ru
 
 	switch cr.effectiveMode {
 	case "mitm":
-		p.handleMITM(clientConn, cr.targetHost, cr.rule, cr.dialCandidates, cr.dialAddr)
+		// handleMITM establishes its own upstream TLS connection, so the plain
+		// TCP connection opened by dialUpstream is no longer needed.
+		if cr.conn != nil {
+			cr.conn.Close()
+			cr.conn = nil
+		}
+		p.handleMITM(clientConn, cr.targetHost, cr.targetAddr, cr.rule, cr.dialCandidates, cr.dialAddr)
 	case "tls-rf":
-		p.handleTLSFragment(clientConn, cr.conn, cr.targetHost, cr.rule)
+		p.handleTLSFragment(clientConn, cr.conn, cr.targetHost, cr.targetAddr, cr.rule)
 	default:
 		p.handleTransparent(clientConn, cr.conn, cr.targetHost, cr.rule)
 	}
@@ -399,8 +410,42 @@ func (p *ProxyServer) handleHTTP(w http.ResponseWriter, req *http.Request, rule 
 	resp, err := transport.RoundTrip(newReq)
 	if err != nil {
 		log.Printf("[HTTP] Proxy failed: %v", err)
-		http.Error(w, "Failed to connect to upstream", http.StatusBadGateway)
-		return
+
+		// Fallback: retry the request through the plain direct transport. Only
+		// safe for body-less requests, since the body stream cannot be rewound.
+		if rule.Mode != "direct" && p.directFallbackEnabled() &&
+			(newReq.Body == nil || newReq.Body == http.NoBody) {
+			retryReq := req.Clone(req.Context())
+			retryReq.RequestURI = ""
+			retryReq.Header.Del("Proxy-Connection")
+			if retryReq.URL.Scheme == "" {
+				if req.TLS != nil {
+					retryReq.URL.Scheme = "https"
+				} else {
+					retryReq.URL.Scheme = "http"
+				}
+			}
+			if retryReq.URL.Host == "" {
+				retryReq.URL.Host = req.Host
+			}
+			if retryReq.Host == "" {
+				retryReq.Host = req.Host
+			}
+			if retryReq.Host == "" {
+				retryReq.Host = retryReq.URL.Host
+			}
+			retryReq.Body = nil
+
+			if retryResp, retryErr := p.transport.RoundTrip(retryReq); retryErr == nil {
+				p.noteFallback(normalizeHost(retryReq.Host), rule, "http upstream failed")
+				resp, err = retryResp, nil
+			}
+		}
+
+		if err != nil {
+			http.Error(w, "Failed to connect to upstream", http.StatusBadGateway)
+			return
+		}
 	}
 	defer resp.Body.Close()
 
