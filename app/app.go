@@ -15,9 +15,10 @@ import (
 
 	"snishaper/common"
 	"snishaper/core"
-	"snishaper/evolution"
-	"snishaper/pkg/certmanager"
-	"snishaper/proxy"
+	"github.com/SnishaperTeam/snishaper-core/certmanager"
+	"github.com/SnishaperTeam/snishaper-core/evolution"
+	"github.com/SnishaperTeam/snishaper-core/netiface"
+	"github.com/SnishaperTeam/snishaper-core/proxy"
 )
 
 // UIAdapter is an optional event sink used by headless builds (the CLI /
@@ -45,7 +46,10 @@ type App struct {
 
 	proxyServer         *proxy.ProxyServer
 	certManager         *certmanager.CertManager
+	certManagerMu       sync.Mutex // 保护 certManager：GUI 绑定与启动钩子并发初始化
 	ruleManager         *proxy.RuleManager
+	settingsPath        string
+	rulesPath           string
 	evolutionTester     *evolution.Tester
 	evolutionTesterMu   sync.Mutex
 	certPath            string
@@ -65,7 +69,13 @@ type App struct {
 	cancel              context.CancelFunc
 	launchedAtStartup   bool
 	autoProxyAtStartup  bool
+	recoveryReport      LeftoverSystemProxyReport
+	// startupMigrationReport 是启动加载配置时产生的迁移/校验报告，
+	// 由 GetLastMigrationReport 暴露给前端展示（无内容时各列表为空）。
+	startupMigrationReport proxy.MigrationReport
 	core                *core.CoreClient
+	// ifaces 用于 UI 侧网卡列举与配置变更后的缓存失效。
+	ifaces *netiface.Selector
 	tunSysProxyMu       sync.Mutex // 保护 tunRestoreSysProxy：调用方与 StartTUN 异步 goroutine 并发访问
 	tunRestoreSysProxy  bool
 	pendingShow         bool
@@ -79,6 +89,10 @@ type App struct {
 	sourceRankAt        map[string]time.Time
 	rulesWatchMu        sync.Mutex
 	rulesWatchStop      func()
+
+	noticesMu      sync.Mutex
+	noticesPayload *NoticesPayload
+	noticesFetched time.Time
 }
 
 // ShouldQuit returns whether the app should quit.
@@ -157,6 +171,10 @@ func (a *App) writeLogFile(s string) {
 	}
 }
 
+// Hoisted so appendLog's hot path (every log line) does not recompile or
+// re-lookup the pattern per call.
+var logLinePrefixRe = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`)
+
 func (a *App) appendLog(message string) {
 	trimmed := strings.TrimSpace(message)
 	if trimmed == "" {
@@ -164,7 +182,7 @@ func (a *App) appendLog(message string) {
 	}
 
 	var formatted string
-	if matched, _ := regexp.MatchString(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`, trimmed); matched {
+	if logLinePrefixRe.MatchString(trimmed) {
 		formatted = trimmed
 	} else {
 		formatted = time.Now().Format("2006/01/02 15:04:05.000000") + " " + trimmed
@@ -264,11 +282,10 @@ func (a *App) startupV3() {
 			a.launchedAtStartup, a.autoProxyAtStartup, a.GetAutoEnableProxyOnAutoStart()))
 	}
 
-	var err error
-	a.certManager, err = certmanager.InitCertManager(a.certPath)
-	if err != nil {
-		a.appendLog("[startup] Failed to init cert manager: " + err.Error())
+	if cm, cmErr := certmanager.InitCertManager(a.certPath); cmErr != nil {
+		a.appendLog("[startup] Failed to init cert manager: " + cmErr.Error())
 	} else {
+		a.setCertManager(cm)
 		a.appendLog("[startup] Cert manager initialized: " + a.certPath)
 	}
 
@@ -288,6 +305,11 @@ func (a *App) startupV3() {
 			a.appendLog("[startup] Core process synchronized successfully")
 		}
 	}
+
+	// Recover network state a crashed previous instance may have left behind
+	// (system proxy still pointing at a dead listener). Runs before the
+	// auto-enable logic so a re-enable lands on top of a clean state.
+	a.recoveryReport = a.recoverLeftoverSystemProxy()
 
 	if a.ShouldAutoEnableProxyOnAutoStart() {
 		a.appendLog("[startup] AutoStart: Auto-enabling proxy as configured")
@@ -354,9 +376,12 @@ func (a *App) autoEnableProxyAtStartup() {
 
 // startRouteEventsPoller forwards route events from the core process to the
 // frontend (app:route), since the core RPC only buffers them for polling.
+// Each poll is a fresh RPC connection, so an idle proxy backs off: 500 ms
+// while events keep arriving, growing to 4 s when there is nothing to fetch.
 func (a *App) startRouteEventsPoller() {
 	a.runSafeAsync("route events poller", func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		interval := 500 * time.Millisecond
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -369,7 +394,18 @@ func (a *App) startRouteEventsPoller() {
 			}
 			events := a.core.GetRouteEvents()
 			if len(events) == 0 {
+				// Empty (or the core is unreachable): poll less often. The
+				// core buffers at most 200 events, so a 4 s idle interval
+				// still drains everything long before the buffer turns over.
+				if interval < 4*time.Second {
+					interval *= 2
+					ticker.Reset(interval)
+				}
 				continue
+			}
+			if interval != 500*time.Millisecond {
+				interval = 500 * time.Millisecond
+				ticker.Reset(interval)
 			}
 			for _, e := range events {
 				a.invokeAsync(func() {
@@ -404,9 +440,10 @@ func (a *App) shutdown() {
 		}
 	}
 
-	// 2. Disable system proxy synchronously
-	status := a.GetSystemProxyStatus()
-	if status.Enabled {
+	// 2. Disable system proxy synchronously — only when it is the proxy this
+	// app configured. A user's own or third-party proxy setting must survive
+	// our exit (same rule as StopProxy and startup recovery).
+	if a.IsManagedSystemProxy() {
 		a.appendLog("[shutdown] Disabling system proxy...")
 		if err := a.applySystemProxySync(false, 0, true); err != nil {
 			errs = append(errs, "SystemProxy: "+err.Error())

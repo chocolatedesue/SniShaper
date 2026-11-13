@@ -1,6 +1,6 @@
 import React, { Suspense, lazy, useState, useEffect, useCallback, useRef, createContext, useContext } from 'react';
 import { HashRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom';
-import { Box, CssBaseline, ThemeProvider, AppBar, Toolbar, Typography, CircularProgress } from '@mui/material';
+import { Box, CssBaseline, ThemeProvider, AppBar, Toolbar, Typography, CircularProgress, useColorScheme } from '@mui/material';
 import { alpha } from '@mui/material/styles';
 import { keyframes } from '@emotion/react';
 import Sidebar from './components/Sidebar';
@@ -12,7 +12,8 @@ import {
   GetShowMainWindowOnAutoStart, GetAutoEnableProxyOnAutoStart, GetAutoEnableSysProxyOnAutoStart, GetAutoUpdateRules,
   GetTUNConfig, GetTUNStatus, GetCloudflareConfig,
   GetCAInstallStatus, GetInstalledCerts, GetCloudflareIPStats,
-  GetLanguage, GetTheme, SetTheme, GetIPv6Available, GetTutorialDone, EventsOn
+  GetLanguage, GetTheme, SetTheme, GetIPv6Available, GetTutorialDone, GetAppearanceMode, EventsOn,
+  GetNetworkRecoveryReport
 } from './api/bindings';
 import { I18nProvider, useTranslation } from './i18n/I18nContext';
 import { toast } from './lib/toast';
@@ -28,7 +29,9 @@ const Proxies = lazy(() => import('./pages/Proxies'));
 const Rules = lazy(() => import('./pages/Rules'));
 const Routing = lazy(() => import('./pages/Routing'));
 const Logs = lazy(() => import('./pages/Logs'));
+const Connections = lazy(() => import('./pages/Connections'));
 const Settings = lazy(() => import('./pages/Settings'));
+const Profiles = lazy(() => import('./pages/Profiles'));
 const DNS = lazy(() => import('./pages/DNS'));
 const About = lazy(() => import('./pages/About'));
 const Evolution = lazy(() => import('./pages/Evolution'));
@@ -92,7 +95,9 @@ const App: React.FC = () => {
     void import('./pages/DNS');
     void import('./pages/Evolution');
     void import('./pages/Logs');
+    void import('./pages/Connections');
     void import('./pages/Settings');
+    void import('./pages/Profiles');
     void import('./pages/About');
   }, []);
 
@@ -100,9 +105,9 @@ const App: React.FC = () => {
     const fastLoad = async () => {
       try {
         const [language, port, closeToTray, autoStart,
-          showMainOnAutoStart, autoEnableProxyOnAutoStart, autoEnableSysProxyOnAutoStart, autoUpdateRules, cfConfig, ipv6Available] = await Promise.all([
+          showMainOnAutoStart, autoEnableProxyOnAutoStart, autoEnableSysProxyOnAutoStart, autoUpdateRules, cfConfig, ipv6Available, savedThemeId] = await Promise.all([
           GetLanguage(), GetListenPort(), GetCloseToTray(), GetAutoStart(),
-          GetShowMainWindowOnAutoStart(), GetAutoEnableProxyOnAutoStart(), GetAutoEnableSysProxyOnAutoStart(), GetAutoUpdateRules(), GetCloudflareConfig(), GetIPv6Available()
+          GetShowMainWindowOnAutoStart(), GetAutoEnableProxyOnAutoStart(), GetAutoEnableSysProxyOnAutoStart(), GetAutoUpdateRules(), GetCloudflareConfig(), GetIPv6Available(), GetTheme()
         ]);
         if (language) {
           localStorage.setItem('language', language as string);
@@ -110,6 +115,12 @@ const App: React.FC = () => {
             const tutorialDone = await GetTutorialDone();
             if (!tutorialDone) setShowTutorial(true);
           } catch { /* non-fatal */ }
+        }
+        // settings.json 里的主题 ID 优先于 localStorage 缓存；后端存的是
+        // 主题 ID 本身，"dark" 这类历史默认值不在 availableThemes 里会被忽略。
+        if (typeof savedThemeId === 'string' && availableThemes.some((th) => th.id === savedThemeId)) {
+          setThemeId(savedThemeId);
+          localStorage.setItem('theme-id', savedThemeId);
         }
         setSettingsCache(prev => ({
           ...prev,
@@ -196,7 +207,11 @@ const App: React.FC = () => {
           settingsCache={settingsCache}
           updateSettingsCache={updateSettingsCache}
           themeId={themeId}
-          onThemeChange={(id: string) => { setThemeId(id); localStorage.setItem('theme-id', id); }}
+          onThemeChange={(id: string) => {
+            setThemeId(id);
+            localStorage.setItem('theme-id', id);
+            SetTheme(id).catch(() => {});
+          }}
           showTutorial={showTutorial}
           onTutorialFinish={() => setShowTutorial(false)}
         />
@@ -226,7 +241,9 @@ const AppRoutes: React.FC<{ settingsCache: SettingsCache, updateSettingsCache: a
             <Route path="/dns" element={<DNS />} />
             <Route path="/evolution" element={<Evolution />} />
             <Route path="/logs" element={<Logs />} />
+            <Route path="/connections" element={<Connections />} />
             <Route path="/settings" element={<Settings cache={settingsCache} onCacheUpdate={updateSettingsCache} currentThemeId={themeId} onThemeChange={onThemeChange} />} />
+            <Route path="/profiles" element={<Profiles />} />
             <Route path="/about" element={<About />} />
           </Routes>
         </Suspense>
@@ -261,6 +278,33 @@ const AppContent: React.FC<{ settingsCache: SettingsCache, updateSettingsCache: 
       toast.error(t('network.ipv6_disabled'));
     }
   }, [settingsCache.ipv6Available, t]);
+
+  // 启动时后端会检测上次崩溃遗留的系统代理设置；前端挂载且语言就绪后拉取报告并提示。
+  const recoveryLanguage = settingsCache.language;
+  useEffect(() => {
+    if (!recoveryLanguage) return;
+    GetNetworkRecoveryReport().then((report: any) => {
+      if (!report || !report.detected) return;
+      if (report.action === 'recovered') {
+        toast.success(t('network.recovery_recovered'), report.server);
+      } else if (report.action === 'left') {
+        toast.info(t('network.recovery_left'), report.server);
+      } else if (report.action === 'error') {
+        toast.error(t('network.recovery_failed'), report.error || '');
+      }
+    }).catch(() => { /* report is best-effort UI */ });
+    // 只需在语言就绪后执行一次；报告在后端整个会话期间有效。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recoveryLanguage]);
+
+  // 外观模式（浅色/深色/跟随系统）以 settings.json 为准；MUI 会先从 localStorage
+  // 恢复避免闪烁，后端有已保存值时再覆盖。旧版本未写过该字段时保持本地选择。
+  const { setMode } = useColorScheme();
+  useEffect(() => {
+    GetAppearanceMode().then((m) => {
+      if (m === 'light' || m === 'dark' || m === 'system') setMode(m);
+    }).catch(() => {});
+  }, [setMode]);
 
   if (!settingsCache.language) {
     return (

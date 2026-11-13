@@ -6,6 +6,8 @@ import logoUrl from '../assets/logo.svg';
 import {
   Activity,
   FileText,
+  Link,
+  Map,
   Settings,
   Shield,
   RefreshCcw,
@@ -15,6 +17,7 @@ import {
   Bolt,
 } from '../lib/icons';
 import { useTranslation } from '../i18n/I18nContext';
+import { SetAppearanceMode } from '../api/bindings';
 
 const DRAWER_WIDTH = 240;
 
@@ -26,6 +29,8 @@ const getNavItems = (t: any) => [
   { path: '/dns', label: t('sidebar.dns'), icon: Antenna },
   { path: '/evolution', label: t('evolution.title'), icon: Bolt },
   { path: '/logs', label: t('sidebar.logs'), icon: FileText },
+  { path: '/connections', label: t('sidebar.connections'), icon: Link },
+  { path: '/profiles', label: t('sidebar.profiles'), icon: Map },
   { path: '/settings', label: t('sidebar.settings'), icon: Settings },
   { path: '/about', label: t('sidebar.about'), icon: Info },
 ];
@@ -111,7 +116,11 @@ const SidebarContent: React.FC = () => {
           <IconButton
             size="small"
             aria-label={mode === 'light' ? t('sidebar.dark_mode_aria') : t('sidebar.light_mode_aria')}
-            onClick={() => setMode(mode === 'light' ? 'dark' : 'light')}
+            onClick={() => {
+              const next = mode === 'light' ? 'dark' : 'light';
+              setMode(next);
+              SetAppearanceMode(next).catch(() => {});
+            }}
             color={mode === 'dark' ? 'primary' : 'default'}
           >
             {mode === 'light' ? <Sun size={18} /> : <Moon size={18} />}

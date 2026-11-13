@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/rpc"
 	"os"
@@ -15,10 +16,19 @@ import (
 	"time"
 
 	"snishaper/common"
-	"snishaper/proxy"
+	"github.com/SnishaperTeam/snishaper-core/proxy"
 )
 
 const coreRPCAddr = "127.0.0.1:18933"
+
+const (
+	// coreRPCHandshakeTimeout bounds how long either side waits for the
+	// token announcement, so a rogue connection cannot hold a goroutine.
+	coreRPCHandshakeTimeout = 5 * time.Second
+	// maxRPCTokenLen caps the announced token length (one size byte is
+	// already the hard limit at 255; this is a sanity bound).
+	maxRPCTokenLen = 128
+)
 
 var coreRPCToken string
 
@@ -73,6 +83,10 @@ type TUNStatusReply struct {
 
 type SetModeArgs struct {
 	Mode string
+}
+
+type ActiveConnectionsReply struct {
+	Connections []proxy.ConnInfo
 }
 
 type LogsArgs struct {
@@ -209,6 +223,16 @@ func (s *coreService) GetRouteEvents(_ EmptyArgs, reply *RouteEventsReply) error
 	return nil
 }
 
+// GetActiveConnections 透传连接跟踪快照（有界注册表，见 core 的
+// proxy.ActiveConnections）；供 GUI 的实时连接查看器轮询。
+func (s *coreService) GetActiveConnections(_ EmptyArgs, reply *ActiveConnectionsReply) error {
+	reply.Connections = s.runtime.proxyServer.ActiveConnections()
+	if reply.Connections == nil {
+		reply.Connections = []proxy.ConnInfo{}
+	}
+	return nil
+}
+
 func (s *coreService) SetProxyMode(args SetModeArgs, _ *EmptyArgs) error {
 	return s.runtime.proxyServer.SetMode(args.Mode)
 }
@@ -216,6 +240,30 @@ func (s *coreService) SetProxyMode(args SetModeArgs, _ *EmptyArgs) error {
 func (s *coreService) GetProxyMode(_ EmptyArgs, reply *StringReply) error {
 	reply.Value = s.runtime.proxyServer.GetMode()
 	return nil
+}
+
+// verifyHandshake reads the client's token announcement from a freshly
+// accepted connection and reports whether it matches this core instance.
+// It is called before ServeConn, so every RPC method — not just the ones
+// that carry AuthArgs — is unreachable for local processes that did not
+// read the token file. The core runs elevated, and the RPC port is fixed,
+// so without this check any local process could drive TUN up/down, stop
+// the proxy or wipe logs with admin rights.
+func verifyHandshake(conn net.Conn) bool {
+	_ = conn.SetReadDeadline(time.Now().Add(coreRPCHandshakeTimeout))
+	var size [1]byte
+	if _, err := io.ReadFull(conn, size[:]); err != nil {
+		return false
+	}
+	if size[0] == 0 || int(size[0]) > maxRPCTokenLen {
+		return false
+	}
+	buf := make([]byte, size[0])
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return false
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	return string(buf) == coreRPCToken
 }
 
 // RunCoreMain starts the core RPC server. Called from main when --core flag is present.
@@ -234,8 +282,14 @@ func RunCoreMain() error {
 	}
 	defer runtime.shutdown()
 
-	// Write RPC token to file for client to read
-	tokenPath := filepath.Join(runtime.execDir, "core_rpc_token")
+	// Write RPC token to the per-user config dir for the client to read.
+	// Not next to the exe: the portable install keeps the exe in a
+	// user-writable directory, where a non-elevated process could read the
+	// token and then drive the elevated core.
+	tokenPath := filepath.Join(common.UserConfigDir(), "core_rpc_token")
+	if err := os.MkdirAll(filepath.Dir(tokenPath), 0755); err != nil {
+		return fmt.Errorf("failed to prepare RPC token dir: %w", err)
+	}
 	if err := os.WriteFile(tokenPath, []byte(coreRPCToken), 0600); err != nil {
 		return fmt.Errorf("failed to write RPC token: %w", err)
 	}
@@ -290,6 +344,11 @@ func RunCoreMain() error {
 				}
 				_ = conn.Close()
 			}()
+			// Rejected handshakes are closed silently: logging per attempt
+			// would hand a local flooder a disk-fill vector.
+			if !verifyHandshake(conn) {
+				return
+			}
 			server.ServeConn(conn)
 		}(conn)
 	}

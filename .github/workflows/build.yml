@@ -1,15 +1,37 @@
 name: build
 
+# Single build workflow for both direct pushes and pull requests
+# (winget-pkgs style: one workflow, no workflow_run chain, bots invoked
+# from inside the build itself).
+#
+#   push(main)                                -> build only
+#   pull_request(opened/synchronize/reopened) -> CLA gate + build + bots
+#   workflow_dispatch (manual)                -> build only
+#
+# After the contributor agreement is signed, cla.yml reruns the PR's
+# original pull_request run (a rerun keeps the pull_request event, so
+# the checks stay in the PR merge box); the gate then sees cla-signed
+# and lets the full matrix through.
+#
+# Bot label writes never re-trigger this workflow (labeled is not a trigger
+# type), so the labeled -> workflow -> label feedback loop of the previous
+# two-workflow design cannot exist.
 on:
   push:
     branches:
       - main
   pull_request:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
+
+# One build per PR (or per branch); a newer push cancels the stale matrix.
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
-  pull-requests: write
+  pull-requests: read
 
 # GitHub-hosted runners reach the canonical module proxy directly, so CI uses
 # the official source only. The build scripts default to a mirror-first
@@ -19,6 +41,72 @@ env:
   GOPROXY: https://proxy.golang.org,direct
 
 jobs:
+  # ------------------------------------------------------------------
+  # CLA gate — only for pull requests. Direct pushes to main and
+  # manual dispatches skip it entirely.
+  # ------------------------------------------------------------------
+  gate:
+    name: gate
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.decide.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Decide CLA gate
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/bots/common.sh
+          proceed=false
+          if [ -n "${AUTHOR:-}" ] && is_exempt "$AUTHOR"; then
+            proceed=true
+          fi
+          labels="$(gh_retry gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
+          if grep -qx 'cla-signed' <<<"$labels"; then
+            proceed=true
+          fi
+          echo "proceed=$proceed" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # Mark the CI round as running as soon as the gate passes.
+  # ------------------------------------------------------------------
+  mark-running:
+    name: mark CI running
+    needs: gate
+    # Dependabot-triggered runs receive no repo secrets, so the syntax-bot
+    # identity is unavailable there; skip the label state machine for those
+    # PRs (gate still lets the build matrix through).
+    if: >-
+      needs.gate.outputs.proceed == 'true' &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/create-github-app-token@v3
+        id: syntax_token
+        with:
+          app-id: ${{ secrets.SYNTAX_BOT_APP_ID }}
+          private-key: ${{ secrets.SYNTAX_BOT_PRIVATE_KEY }}
+
+      - name: Add ci-running label
+        env:
+          GH_TOKEN: ${{ steps.syntax_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/bots/common.sh
+          # sync_labels clears ci-failed/ci-passed (mutual-exclusion group)
+          # plus syntax-review, changes-requested and approved (new round)
+          # automatically.
+          sync_labels "$PR_NUMBER" "ci-running" ""
+
   # ------------------------------------------------------------------
   # GUI matrix — one (platform, arch) pair per job, GUI builds only.
   # The CLI is pure Go with CGO_ENABLED=0 and is produced by the dedicated
@@ -33,10 +121,17 @@ jobs:
   #
   # Every job also greps its build log for aarch64-linux-gnu / osxcross and
   # fails if a cross toolchain shows up. This workflow is build + smoke only:
-  # packaging (MSIX / 7z / tar.gz) happens in the release pipeline.
+  # packaging (MSIX / zip / tar.gz) happens in the release pipeline.
+  #
+  # Runs unconditionally for direct pushes / manual dispatches; for pull
+  # requests only when the gate passed.
   # ------------------------------------------------------------------
   matrix-build:
     name: GUI ${{ matrix.platform }}/${{ matrix.arch }} on ${{ matrix.runner }}
+    needs: gate
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'pull_request' || needs.gate.outputs.proceed == 'true')
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -68,8 +163,25 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
+        id: go
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # setup-go caches the module cache only; the compiler's own object cache
+      # is what makes a rebuild of the same tree cheap, and it survives between
+      # runs only when it is cached explicitly.
+      - name: Cache Go build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/AppData/Local/go-build
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: go-build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ matrix.arch }}-
+            go-build-${{ runner.os }}-
 
       - uses: actions/setup-node@v7
         with:
@@ -81,11 +193,52 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      # The GTK/WebKitGTK packages are the slowest download in this workflow and
+      # their .deb files are immutable, so they are cached and staged back into
+      # /var/cache/apt/archives before apt runs. Bump the version suffix in the
+      # key whenever the package list below changes.
+      - name: Cache apt packages (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: apt-${{ matrix.runner }}-v1
+          restore-keys: |
+            apt-${{ matrix.runner }}-
+
       - name: Install Linux GUI dependencies (GTK4 / WebKitGTK)
         if: runner.os == 'Linux'
+        timeout-minutes: 10
         run: |
+          set -euo pipefail
+          cache="${{ runner.temp }}/apt-archives"
+          mkdir -p "$cache"
+          if compgen -G "$cache/*.deb" > /dev/null; then
+            sudo cp -n "$cache"/*.deb /var/cache/apt/archives/ || true
+            echo "::notice::restored $(ls -1 "$cache"/*.deb | wc -l) cached .deb files"
+          fi
+          # The Azure archive mirror stalls on large packages (observed on
+          # libjavascriptcoregtk-6.0-1 on the arm64 runner); point apt at the
+          # default Ubuntu archive and fail fast instead of retrying a dead
+          # connection.
+          sudo tee /etc/apt/apt.conf.d/99-ci-timeout <<'EOF'
+          Acquire::Retries "0";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          DPkg::Lock::Timeout "120";
+          EOF
+          for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources; do
+            if [ -f "$f" ]; then
+              sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' "$f"
+            fi
+          done
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libgtk-4-dev libwebkitgtk-6.0-dev
+          # Collect everything apt downloaded (and the packages it unpacked
+          # from) for the next run.
+          cp -n /var/cache/apt/archives/*.deb "$cache"/ 2>/dev/null || true
+          echo "::notice::apt archive cache now holds $(ls -1 "$cache"/*.deb 2>/dev/null | wc -l) files"
 
       - name: Build GUI (build.sh --ci)
         if: matrix.script == 'sh'
@@ -115,6 +268,65 @@ jobs:
             exit 1
           }
 
+      - name: Build CLI (Linux matrix entry)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          # One CLI target per matrix entry, built natively by the same job
+          # as the GUI (pure Go, CGO off) instead of cross-building all five
+          # on a single runner. The Windows entry has its own pwsh step:
+          # build_windows.ps1 cannot be executed by bash.
+          set -o pipefail
+          chmod +x build.sh
+          ./build.sh --ci --platform linux --arch "${{ matrix.arch }}" --type cli 2>&1 | tee build-cli.log
+          test -f "build/bin/cli/Linux/${{ matrix.arch }}/snishaper" || { echo "::error::CLI binary missing"; exit 1; }
+          V="$(./build/bin/cli/Linux/${{ matrix.arch }}/snishaper version)"
+          echo "::notice::CLI (${{ matrix.arch }}) version: $V"
+          test -n "$V" || { echo "::error::empty CLI version"; exit 1; }
+
+      - name: Build CLI (Windows matrix entry)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./build_windows.ps1 -CI -Platform windows -Arch "${{ matrix.arch }}" -Type cli -Silent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bin = ".\build\bin\cli\Windows\${{ matrix.arch }}\snishaper.exe"
+          if (-not (Test-Path $bin)) { Write-Host "::error::CLI binary missing"; exit 1 }
+          # An ARM64 PE cannot execute on the x64 runner (Windows only emulates
+          # x64 on ARM64, never the other way round), so arm64 gets a PE machine
+          # type assertion in "Verify artifacts (Windows)" instead of a smoke run.
+          if ('${{ matrix.arch }}' -ne 'arm64') {
+            $v = (& $bin version).Trim()
+            Write-Host "::notice::CLI (${{ matrix.arch }}) version: $v"
+            if (-not $v) { Write-Host "::error::empty CLI version"; exit 1 }
+          }
+
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ci/build-summary.sh
+          plat="${{ matrix.platform }}"
+          cap="$(echo "${plat:0:1}" | tr '[:lower:]' '[:upper:]')${plat:1}"
+          bin="snishaper"
+          if [ "${{ runner.os }}" = "Linux" ]; then bin="SniShaper"; fi
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="snishaper.exe"; fi
+          cliRow=""
+          if [ "${{ matrix.platform }}" = "windows" ]; then cliRow="--row cli=build/bin/cli/Windows/${{ matrix.arch }}/snishaper.exe"; fi
+          if [ "${{ matrix.platform }}" = "linux" ]; then cliRow="--row cli=build/bin/cli/Linux/${{ matrix.arch }}/snishaper"; fi
+          .github/scripts/ci/build-summary.sh record \
+            --project SniShaper \
+            --target "GUI ${plat}/${{ matrix.arch }}" \
+            --tasks "frontend, gui, cli" \
+            --runner "${{ matrix.runner }}" \
+            --outcome "${{ job.status }}" \
+            --cache-hit "${{ steps.go.outputs.cache-hit }}" \
+            --row "${plat}/${{ matrix.arch }}=build/bin/gui/${cap}/${{ matrix.arch }}/${bin}" \
+            $cliRow \
+            --dir "build/bin/gui/${cap}/${{ matrix.arch }}"
+
       - name: Verify artifacts (Unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -126,77 +338,51 @@ jobs:
         shell: pwsh
         run: |
           $machines = @{ 0x8664 = 'x64'; 0xAA64 = 'arm64'; 0x014C = 'x86' }
+          function Get-PeMachine([string] $path) {
+            $fs = [System.IO.File]::OpenRead($path)
+            try {
+              $fs.Seek(0x3C, 'Begin') | Out-Null
+              $buf = New-Object byte[] 4
+              $fs.Read($buf, 0, 4) | Out-Null
+              $pe = [BitConverter]::ToUInt32($buf, 0)
+              $fs.Seek($pe + 4, 'Begin') | Out-Null
+              $m = New-Object byte[] 2
+              $fs.Read($m, 0, 2) | Out-Null
+              return [int][BitConverter]::ToUInt16($m, 0)
+            } finally {
+              $fs.Close()
+            }
+          }
           $bins = Get-ChildItem -Path build\bin -Recurse -Include 'snishaper.exe'
           if (-not $bins) { Write-Host "::error::no binary produced"; exit 1 }
           $bins | ForEach-Object {
-            $fs = [System.IO.File]::OpenRead($_.FullName)
-            $fs.Seek(0x3C, 'Begin') | Out-Null
-            $buf = New-Object byte[] 4
-            $fs.Read($buf, 0, 4) | Out-Null
-            $pe = [BitConverter]::ToUInt32($buf, 0)
-            $fs.Seek($pe + 4, 'Begin') | Out-Null
-            $m = New-Object byte[] 2
-            $fs.Read($m, 0, 2) | Out-Null
-            $fs.Close()
-            $id = [BitConverter]::ToUInt16($m, 0)
+            $id = Get-PeMachine $_.FullName
             Write-Host ("{0} -> {1}" -f $_.FullName, $machines[$id])
           }
-
-  # ------------------------------------------------------------------
-  # CLI: Windows + Linux, cross-built once on a Windows runner. Pure Go,
-  # CGO_ENABLED=0, no cross toolchain. Darwin is handled natively below.
-  # ------------------------------------------------------------------
-  cli-build:
-    name: CLI (windows + linux, 5 targets)
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-
-      - name: Build CLI targets
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          ./build_windows.ps1 -CI -Platform windows,linux -Type cli -Silent
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Verify all five targets exist
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $expected = @(
-            'build\bin\cli\Windows\x64\snishaper.exe',
-            'build\bin\cli\Windows\x86\snishaper.exe',
-            'build\bin\cli\Windows\arm64\snishaper.exe',
-            'build\bin\cli\Linux\x64\snishaper',
-            'build\bin\cli\Linux\arm64\snishaper'
-          )
-          foreach ($f in $expected) {
-            if (-not (Test-Path $f)) { Write-Host "::error::missing $f"; exit 1 }
-            Write-Host "built: $f"
+          # The CLI built in this job cannot be smoke run on an ARM64 matrix
+          # entry, so its PE machine type is what proves the target was right.
+          $cli = "build\bin\cli\Windows\${{ matrix.arch }}\snishaper.exe"
+          if (Test-Path $cli) {
+            $want = $machines.Keys | Where-Object { $machines[$_] -eq '${{ matrix.arch }}' }
+            $got = Get-PeMachine $cli
+            if ($got -ne $want) {
+              Write-Host ("::error::CLI PE machine is {0}, expected {1}" -f $machines[$got], '${{ matrix.arch }}')
+              exit 1
+            }
+            Write-Host "::notice::CLI PE machine matches ${{ matrix.arch }}"
           }
 
-      - name: Smoke test
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $v = (& .\build\bin\cli\Windows\x64\snishaper.exe version).Trim()
-          Write-Host "::notice::CLI version: $v"
-          if (-not $v) { Write-Host "::error::empty CLI version"; exit 1 }
-          & .\build\bin\cli\Windows\x64\snishaper.exe help | Out-Null
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::CLI help failed"; exit 1 }
-
   # ------------------------------------------------------------------
-  # CLI: Darwin, built natively and smoke-tested on real macOS runners.
-  #   darwin/x64  -> macos-26-intel (last x86_64 image, EOL Aug 2027)
-  #   darwin/arm64-> macos-26      (Apple Silicon)
+  # CLI: Windows + Linux targets are built natively by the matrix jobs
+  # above (one target per matrix entry, same job as the GUI). Darwin is
+  # handled natively below.
   # ------------------------------------------------------------------
-  darwin-cli:
-    name: CLI ${{ matrix.platform }}/${{ matrix.arch }} on ${{ matrix.runner }}
+  darwin:
+    name: darwin ${{ matrix.arch }} on ${{ matrix.runner }}
+    needs: gate
+    if: >-
+      always() && !cancelled() &&
+      (github.event_name != 'pull_request' || needs.gate.outputs.proceed == 'true')
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -214,8 +400,22 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v7
+        id: go
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Cache Go build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/AppData/Local/go-build
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: go-build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ matrix.arch }}-
+            go-build-${{ runner.os }}-
 
       - name: Build CLI (build.sh --ci)
         shell: bash
@@ -240,3 +440,142 @@ jobs:
           if [ -z "$V" ]; then echo "::error::empty CLI version"; exit 1; fi
           "$BIN" help >/dev/null
 
+      # Status contract: the menu bar app polls `snishaper status --json`
+      # every 3 seconds, so the JSON shape (at minimum the "service" key)
+      # is asserted on both architectures.
+      - name: Verify status --json contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="build/bin/cli/Darwin/${{ matrix.arch }}/snishaper"
+          OUT="$("$BIN" status --json)"
+          echo "status --json: $OUT"
+          echo "$OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "service" in d, "missing service key"'
+
+      - name: Bundle SniShaper.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x macos/scripts/bundle-app.sh
+          # --cli reuses the binary built above; bundle-app.sh would
+          # otherwise rebuild it via build.sh.
+          macos/scripts/bundle-app.sh --cli "$PWD/build/bin/cli/Darwin/${{ matrix.arch }}/snishaper"
+          APP="build/bin/macos/SniShaper.app"
+          test -x "$APP/Contents/MacOS/SnishaperBar"
+          test -x "$APP/Contents/Resources/bin/snishaper"
+          test -f "$APP/Contents/Info.plist"
+          test -f "build/bin/macos/SniShaper-macos-$(uname -m).zip"
+          echo "::notice::bundled SniShaper.app ($(uname -m))"
+
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ci/build-summary.sh
+          .github/scripts/ci/build-summary.sh record \
+            --project SniShaper \
+            --target "CLI darwin/${{ matrix.arch }}" \
+            --tasks "cli, SnishaperBar app bundle" \
+            --runner "${{ matrix.runner }}" \
+            --outcome "${{ job.status }}" \
+            --cache-hit "${{ steps.go.outputs.cache-hit }}" \
+            --row "darwin/${{ matrix.arch }}=build/bin/cli/Darwin/${{ matrix.arch }}/snishaper" \
+            --row "SniShaper.app zip=build/bin/macos/SniShaper-macos-*.zip"
+
+  # ------------------------------------------------------------------
+  # Stable single-point summary used as the required status check in
+  # branch protection ("ci"). Succeeds when every build job succeeded
+  # or was skipped (gate-skipped PR runs skip the whole matrix); fails on
+  # any real failure so a red build blocks the merge.
+  # ------------------------------------------------------------------
+  ci:
+    name: ci
+    needs: [gate, matrix-build, darwin]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Assert build outcome
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          failed="$(jq '[.[] | select(.result != "success" and .result != "skipped")] | length' <<<"$RESULTS")"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::one or more required CI jobs did not succeed"
+            exit 1
+          fi
+          echo "all required CI jobs succeeded (or were skipped)"
+
+      - name: Write run summary
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ci/build-summary.sh
+          .github/scripts/ci/build-summary.sh report --title "SniShaper Build Summary"
+
+  # ------------------------------------------------------------------
+  # Bots — invoked directly from the build (no separate listener
+  # workflow). Only for pull-request rounds that passed the gate; label
+  # writes never re-trigger this workflow, so there is no feedback loop.
+  # ------------------------------------------------------------------
+  bot-report:
+    name: Report CI result (syntax-bot)
+    needs: [gate, ci]
+    if: >-
+      always() && !cancelled() &&
+      needs.gate.outputs.proceed == 'true' &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      # GITHUB_TOKEN grants for the diagnostic log download; comment and
+      # label writes go through the syntax-bot App token instead.
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/create-github-app-token@v3
+        id: syntax_token
+        with:
+          app-id: ${{ secrets.SYNTAX_BOT_APP_ID }}
+          private-key: ${{ secrets.SYNTAX_BOT_PRIVATE_KEY }}
+
+      - name: Diagnose failure and mark changes requested
+        if: needs.ci.result == 'failure'
+        env:
+          GH_TOKEN: ${{ steps.syntax_token.outputs.token }}
+          LOG_GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/bots/common.sh
+          # Fresh comment per CI round (per-run anchor, no upsert): each
+          # round shows up in the PR timeline with a notification instead
+          # of silently editing an old comment.
+          body="<!-- snishaper-bot:ci-diagnostic:${RUN_ID} -->
+          $(.github/scripts/bots/ci-diagnose.sh "$PR_NUMBER" "$RUN_ID")"
+          gh_retry gh api -X POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+            -f body="$body" >/dev/null
+          # CI failure is itself a bot review verdict: mark the PR as
+          # changes-requested so the state machine reaches its terminal
+          # state without waiting for a human review.
+          sync_labels "$PR_NUMBER" "ci-failed,changes-requested" ""
+
+      - name: Mark CI passed and complete syntax review
+        if: needs.ci.result == 'success'
+        env:
+          GH_TOKEN: ${{ steps.syntax_token.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/bots/common.sh
+          sync_labels "$PR_NUMBER" "ci-passed,syntax-review" ""

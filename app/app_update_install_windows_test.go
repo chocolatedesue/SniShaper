@@ -3,26 +3,66 @@
 package app
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestPsQuoteSingle(t *testing.T) {
-	if got := psQuoteSingle(`C:\Users\O'Brien\app`); got != `C:\Users\O''Brien\app` {
-		t.Fatalf("unexpected escaping: %s", got)
+func TestPortableUpdaterInDir(t *testing.T) {
+	dir := t.TempDir()
+	if got := portableUpdaterInDir(dir); got != "" {
+		t.Fatalf("empty dir should not resolve an updater, got %s", got)
 	}
-	if got := psQuoteSingle(`C:\plain\path`); got != `C:\plain\path` {
-		t.Fatalf("plain path should stay unchanged, got: %s", got)
+	exe := filepath.Join(dir, portableUpdaterName)
+	if err := os.WriteFile(exe, []byte("MZ"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := filepath.Abs(exe)
+	got, _ := filepath.Abs(portableUpdaterInDir(dir))
+	if got != want {
+		t.Fatalf("portableUpdaterInDir = %s, want %s", got, want)
+	}
+	if err := os.Remove(exe); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(exe, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if got := portableUpdaterInDir(dir); got != "" {
+		t.Fatalf("directory must not be treated as updater exe: %s", got)
 	}
 }
 
-func TestBuildUpdateScriptEscapesQuotes(t *testing.T) {
-	script := buildUpdateScript(`C:\tmp\a'b.7z`, `C:\tmp\stage`, `C:\Users\x'y`, `C:\tmp\base`)
-	// 未转义的单引号会截断 PowerShell 字符串，必须翻倍转义
-	if strings.Contains(script, "a'b") || strings.Contains(script, "x'y") {
-		t.Fatal("unescaped single quote in update script")
+func TestUpdaterArgs(t *testing.T) {
+	got := updaterArgs(`C:\Program Files\Snishaper\updater.json`)
+	want := `-config "C:\Program Files\Snishaper\updater.json"`
+	if got != want {
+		t.Fatalf("updaterArgs = %s, want %s", got, want)
 	}
-	if !strings.Contains(script, "a''b") || !strings.Contains(script, "x''y") {
-		t.Fatal("expected doubled single quotes in update script")
+}
+
+func TestInstallUpdatePathHasNoExternalCommands(t *testing.T) {
+	data, err := os.ReadFile("app_update_install_windows.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := strings.ToLower(string(data))
+	for _, banned := range []string{"powershell", "pwsh", "cmd.exe", "cmd /c", "tar -xf", "7z.exe", "apply-update.ps1", "os/exec", "exec.command"} {
+		if strings.Contains(src, banned) {
+			t.Errorf("update install path references external command %q", banned)
+		}
+	}
+}
+
+func TestInstallUpdateAssetRejectsArchiveWithoutUpdater(t *testing.T) {
+	for _, name := range []string{"update.zip", "update.7z", "payload.bin"} {
+		got := archiveInstallError(name)
+		if !strings.Contains(got, "portable updater not found") {
+			t.Errorf("%s: unexpected message %q", name, got)
+		}
+	}
+	if got := archiveInstallError("Snishaper-Setup.exe"); got != "" {
+		t.Errorf("exe fallback should be allowed, got %q", got)
 	}
 }

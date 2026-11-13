@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -497,6 +498,73 @@ func releaseRank(rel githubRelease) int {
 	}
 }
 
+// assetArchToken maps the architecture tokens used in release asset names to
+// one canonical value, so amd64/x64 and 386/x86 compare equal.
+func assetArchToken(lower string) string {
+	switch {
+	case strings.Contains(lower, "arm64"), strings.Contains(lower, "aarch64"):
+		return "arm64"
+	case strings.Contains(lower, "x86_64"), strings.Contains(lower, "amd64"),
+		strings.Contains(lower, "x64"):
+		return "x64"
+	case strings.Contains(lower, "386"), strings.Contains(lower, "x86"):
+		return "x86"
+	}
+	return ""
+}
+
+func runtimeAssetArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x64"
+	case "386":
+		return "x86"
+	case "arm64":
+		return "arm64"
+	}
+	return runtime.GOARCH
+}
+
+// assetOSToken resolves the target OS of an asset name; an installer named
+// only by its .exe suffix belongs to Windows.
+func assetOSToken(lower string) string {
+	switch {
+	case strings.Contains(lower, "windows"):
+		return "windows"
+	case strings.Contains(lower, "linux"):
+		return "linux"
+	case strings.Contains(lower, "darwin"), strings.Contains(lower, "macos"), strings.Contains(lower, "osx"):
+		return "darwin"
+	case strings.HasSuffix(lower, ".exe"):
+		return "windows"
+	}
+	return ""
+}
+
+func isCLIAsset(lower string) bool {
+	return strings.HasPrefix(lower, "snishaper-cli-")
+}
+
+// assetMatchesRuntime keeps only the packages the running process can install:
+// same OS, same architecture, and the flavour of this binary. The signed MSIX
+// bundle (dongle.*.zip / dongle.*.7z) is dropped as well, since it carries no
+// snishaper.exe the in-app updater could extract.
+func assetMatchesRuntime(lower string) bool {
+	if strings.Contains(lower, "unsigned") || strings.HasPrefix(lower, "dongle.") {
+		return false
+	}
+	if strings.HasPrefix(lower, "snishaperupdater-") || strings.HasSuffix(lower, "-update.zip") {
+		return false
+	}
+	if isCLIAsset(lower) != headlessBuild {
+		return false
+	}
+	if osName := assetOSToken(lower); osName != "" && osName != runtime.GOOS {
+		return false
+	}
+	return assetArchToken(lower) == runtimeAssetArch()
+}
+
 func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
 	result := []ReleaseAsset{}
 	for _, asset := range assets {
@@ -505,13 +573,22 @@ func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
 		switch {
 		case strings.HasSuffix(lower, ".exe"):
 			kind = "exe"
-		case strings.HasSuffix(lower, ".7z") && !strings.Contains(lower, "_x64") && !strings.Contains(lower, "_x86") && !strings.Contains(lower, "_arm64") && !strings.Contains(lower, "unsigned"):
+		case strings.HasSuffix(lower, ".zip"):
+			// Portable bundle in the format every supported Windows version
+			// can open on its own; macOS ships its .app as a zip as well.
+			kind = "zip"
+		case strings.HasSuffix(lower, ".7z"):
+			// Legacy archive kept for releases published before the switch
+			// to zip: the Windows installer still understands it.
 			kind = "7z"
 		case strings.HasSuffix(lower, ".tar.gz"):
 			// Portable bundle used by the Linux build, and the only archive
 			// the Linux installer can unpack on its own.
 			kind = "tar.gz"
 		default:
+			continue
+		}
+		if !assetMatchesRuntime(lower) {
 			continue
 		}
 		result = append(result, ReleaseAsset{
@@ -521,7 +598,26 @@ func filterUpdateAssets(assets []githubAsset) []ReleaseAsset {
 			Kind:        kind,
 		})
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		return assetKindRank(result[i].Kind) < assetKindRank(result[j].Kind)
+	})
 	return result
+}
+
+// assetKindRank orders the update list: installer first, then the portable
+// zip, then the legacy 7z archive, then the tarball the Linux build installs
+// from. A release that ships both formats therefore offers the one Windows 10
+// can open natively.
+func assetKindRank(kind string) int {
+	switch kind {
+	case "exe":
+		return 0
+	case "zip":
+		return 1
+	case "7z":
+		return 2
+	}
+	return 3
 }
 
 func buildDownloadURLs(assetURL string, entries []downloadSourceEntry) []string {
@@ -706,32 +802,33 @@ const (
 	defaultDownloadChunkSize   = 8 * 1024 * 1024
 )
 
+// initDownloadTuning resolves the env-tunable download settings once at
+// startup, so the download goroutines read plain fields instead of racing on
+// lazy writes.
+func initDownloadTuning() (concurrency int, chunkSize int64) {
+	concurrency = defaultDownloadConcurrency
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("DOWNLOAD_CONCURRENCY"))); err == nil && v > 0 {
+		concurrency = v
+	}
+	chunkSize = defaultDownloadChunkSize
+	if v, err := strconv.ParseInt(strings.TrimSpace(os.Getenv("DOWNLOAD_CHUNK_SIZE")), 10, 64); err == nil && v > 0 {
+		chunkSize = v
+	}
+	return concurrency, chunkSize
+}
+
 func (a *App) getDownloadConcurrency() int {
 	if a.downloadConcurrency > 0 {
 		return a.downloadConcurrency
 	}
-	n := defaultDownloadConcurrency
-	if s := strings.TrimSpace(os.Getenv("DOWNLOAD_CONCURRENCY")); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 {
-			n = v
-		}
-	}
-	a.downloadConcurrency = n
-	return n
+	return defaultDownloadConcurrency
 }
 
 func (a *App) getDownloadChunkSize() int64 {
 	if a.downloadChunkSize > 0 {
 		return a.downloadChunkSize
 	}
-	n := int64(defaultDownloadChunkSize)
-	if s := strings.TrimSpace(os.Getenv("DOWNLOAD_CHUNK_SIZE")); s != "" {
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
-			n = v
-		}
-	}
-	a.downloadChunkSize = n
-	return n
+	return defaultDownloadChunkSize
 }
 
 func (a *App) downloadConcurrencyFn() download.ConcurrencyFn {
@@ -929,21 +1026,27 @@ func (a *App) setPendingUpdateVerified(path, expectedSHA string) {
 }
 
 func (a *App) InstallUpdateAsset(localPath string) error {
-	// Re-verify the pending download before executing it, so a file swapped
-	// or modified on disk after the download cannot be installed.
+	// Only the file this session downloaded and hash-verified may be
+	// installed. This binding executes a binary with the app's privileges,
+	// so an arbitrary caller-supplied path must never reach the installer —
+	// anything else goes through DownloadUpdateAsset first.
 	a.pendingUpdateMu.Lock()
 	pendingPath, expectedSHA := a.pendingUpdatePath, a.pendingUpdateSHA
 	a.pendingUpdateMu.Unlock()
-	if expectedSHA != "" && strings.EqualFold(localPath, pendingPath) {
-		sum, err := fileSHA256Hex(localPath)
-		if err != nil {
-			return fmt.Errorf("update integrity re-check failed: %v", err)
-		}
-		if !strings.EqualFold(sum, expectedSHA) {
-			return fmt.Errorf("update file changed after download (sha256 mismatch), refusing to install")
-		}
+	if pendingPath == "" || expectedSHA == "" {
+		return fmt.Errorf("no verified update download; run the update download step first")
 	}
-	err := a.installUpdateAsset(localPath)
+	if !strings.EqualFold(localPath, pendingPath) {
+		return fmt.Errorf("refusing to install %s: it is not the verified update download", localPath)
+	}
+	sum, err := fileSHA256Hex(localPath)
+	if err != nil {
+		return fmt.Errorf("update integrity re-check failed: %v", err)
+	}
+	if !strings.EqualFold(sum, expectedSHA) {
+		return fmt.Errorf("update file changed after download (sha256 mismatch), refusing to install")
+	}
+	err = a.installUpdateAsset(localPath)
 	if err == nil {
 		a.SetPendingUpdate("")
 	}

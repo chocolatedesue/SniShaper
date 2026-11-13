@@ -193,8 +193,17 @@ func (a *App) DisableSystemProxy() error {
 	return nil
 }
 
+// Platform seams for the regression tests: tests swap these package vars to
+// simulate system proxy state without mutating the proxy settings of the
+// machine the tests run on. Production code must call these, never the
+// sysproxy package directly.
+var (
+	sysproxyStatusFn  = sysproxy.GetSystemProxyStatus
+	sysproxyDisableFn = sysproxy.DisableSystemProxy
+)
+
 func (a *App) GetSystemProxyStatus() SystemProxyStatus {
-	status := sysproxy.GetSystemProxyStatus()
+	status := sysproxyStatusFn()
 	return SystemProxyStatus{
 		Enabled:  status.Enabled,
 		Server:   status.Server,
@@ -276,7 +285,9 @@ func (a *App) SetAutoEnableSysProxyOnAutoStart(enabled bool) error {
 }
 
 // ForceCleanup is a last-resort synchronous cleanup for crash/force-exit paths.
-// It stops TUN, core, proxy, and system proxy without checking state.
+// It stops TUN, core, proxy, and the system proxy this app configured. A
+// system proxy the app does not own (user's own or third-party) is left in
+// place, matching shutdown(), StopProxy and startup recovery.
 func (a *App) ForceCleanup() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -292,8 +303,10 @@ func (a *App) ForceCleanup() {
 	if a.proxyServer != nil {
 		_ = a.proxyServer.Stop()
 	}
-	if err := sysproxy.DisableSystemProxy(); err != nil {
-		log.Printf("[ForceCleanup] sysproxy disable: %v", err)
+	if a.IsManagedSystemProxy() {
+		if err := sysproxyDisableFn(); err != nil {
+			log.Printf("[ForceCleanup] sysproxy disable: %v", err)
+		}
 	}
 	a.closeLogFile()
 }

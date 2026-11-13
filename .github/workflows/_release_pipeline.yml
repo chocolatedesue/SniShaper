@@ -31,7 +31,7 @@ on:
         description: "MSIX signing certificate password (default: password)"
         required: false
       MSIX_PFX_BASE64:
-        description: Base64 content of devcert.pfx signing certificate (used when repo has no certificate)
+        description: Base64 content of the MSIX signing certificate (devcert.pfx); without it an ephemeral certificate is generated per build
         required: false
       OLLAMA_MODEL:
         description: "Local Ollama model for release notes summary (default: qwen3.5:2b); used when LLM_API_KEY is not set"
@@ -62,8 +62,9 @@ jobs:
     runs-on: ubuntu-26.04
     env:
       RELEASE_BOT_NAME: SnishaperTeam-ReleaseBot
-      RELEASE_BOT_EMAIL: youmao2023@outlook.com
+      RELEASE_BOT_EMAIL: dongle2823@163.com
       SIGNING_READY: ${{ secrets.GPG_PRIVATE_KEY != '' && secrets.GPG_PASSPHRASE != '' }}
+      RELEASE_BOT_READY: ${{ secrets.RELEASE_BOT_APP_ID != '' && secrets.RELEASE_BOT_PRIVATE_KEY != '' }}
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       tag: ${{ steps.resolve.outputs.tag }}
@@ -74,10 +75,25 @@ jobs:
       identity_version: ${{ steps.resolve.outputs.identity_version }}
       skip: ${{ steps.release-check.outputs.skip }}
     steps:
+      # Pushes to main authenticate as the release bot app (in the
+      # main-branch-protection ruleset bypass list); GITHUB_TOKEN pushes
+      # are attributed to github-actions[bot] and can never satisfy the
+      # required status checks on a direct push.
+      - name: Generate release bot token
+        id: bot
+        if: env.RELEASE_BOT_READY == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          token: ${{ steps.bot.outputs.token || github.token }}
 
       - name: Import release bot signing key
         if: env.SIGNING_READY == 'true'
@@ -249,8 +265,10 @@ jobs:
           exit 1
 
   # ------------------------------------------------------------------
-  # Windows build (windows-2025): MSIX (signed + unsigned), portable 7z,
-  # signed bundle 7z, Inno Setup installer. No release publishing here.
+  # Windows build (windows-2025): MSIX (signed + unsigned), portable zip,
+  # signed bundle zip, Inno Setup installer. No release publishing here.
+  # Archives are zip (not 7z): every supported Windows version opens it
+  # without third-party tools, which is what the in-app updater relies on.
   # ------------------------------------------------------------------
   build-windows:
     name: Build Windows (${{ inputs.channel }})
@@ -262,6 +280,8 @@ jobs:
     env:
       MSIX_PFX_PASSWORD: ${{ secrets.MSIX_PFX_PASSWORD }}
       MSIX_PFX_BASE64: ${{ secrets.MSIX_PFX_BASE64 }}
+      UPDATER_SIGNING_READY: ${{ secrets.UPDATER_ED25519_SEED != '' }}
+      UPDATER_ED25519_SEED: ${{ secrets.UPDATER_ED25519_SEED }}
     steps:
       - name: Checkout full history
         uses: actions/checkout@v7
@@ -269,9 +289,82 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Go
+        id: go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build portable updater
+        shell: pwsh
+        env:
+          UPDATER_PUBLIC_KEY_READY: ${{ secrets.UPDATER_ED25519_SEED != '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $env:GITHUB_WORKSPACE
+          $repo = "${{ github.repository }}"
+          $appIds = @{
+            'x64' = '{3F2E4DA1-5C8B-4ECD-BDC4-426A5965F8D4}'
+            'x86' = '{3F2E4DA1-5C8B-4ECD-BDC4-426A5965F8D5}'
+            'arm64' = '{3F2E4DA1-5C8B-4ECD-BDC4-426A5965F8D6}'
+          }
+          $pubKey = ''
+          if ($env:UPDATER_PUBLIC_KEY_READY -eq 'true') {
+            $pubOut = Join-Path $env:TEMP 'snishaper-updater-public-key.txt'
+            & go run ./updater/signmanifest -pub-out $pubOut
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::cannot derive updater public key"
+              exit 1
+            }
+            $pubKey = (Get-Content -LiteralPath $pubOut -Raw).Trim()
+          }
+          $archMap = @{ 'x64' = 'amd64'; 'x86' = '386'; 'arm64' = 'arm64' }
+          foreach ($a in $archMap.Keys) {
+            $dir = Join-Path $root "build/bin/updater/Windows/$a"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            $out = Join-Path $dir 'SniShaperUpdater.exe'
+            $env:GOOS = 'windows'
+            $env:CGO_ENABLED = '0'
+            $env:GOARCH = $archMap[$a]
+            & go build -trimpath -ldflags '-s -w' -o $out ./updater
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::updater build failed for $a"
+              exit 1
+            }
+            $config = [ordered]@{
+              manifest_url = "https://github.com/$repo/releases/latest/download/updater-manifest-$a.json"
+              mirror_urls = @()
+              public_key = $pubKey
+              channel = 'stable'
+              arch = $a
+              installer_pattern = '*Setup.exe'
+              installer_name = ''
+              process_names = @('snishaper.exe')
+              app_id = $appIds[$a]
+              install_dir = ''
+              local_version = 'auto'
+              verify_authenticode = $false
+              restart_after_install = $false
+              http_timeout_minutes = 30
+              max_retries = 3
+              max_extract_bytes = 1073741824
+            }
+            [System.IO.File]::WriteAllText((Join-Path $dir 'updater.json'), ($config | ConvertTo-Json -Depth 6), [System.Text.UTF8Encoding]::new($false))
+            Write-Host "::notice::portable updater built for $a"
+          }
+          Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
+
+      - name: Cache Go build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/AppData/Local/go-build
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: go-build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ matrix.arch }}-
+            go-build-${{ runner.os }}-
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -307,9 +400,6 @@ jobs:
             exit 1
           }
 
-      - name: Install 7-Zip
-        run: choco install 7zip -y --no-progress
-
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
@@ -321,10 +411,12 @@ jobs:
           if ($env:MSIX_PFX_BASE64) {
             [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:MSIX_PFX_BASE64))
             Write-Host "::notice::devcert.pfx restored from secret MSIX_PFX_BASE64"
-          } elseif (Test-Path $certPath) {
-            Write-Host "::notice::using repo devcert.pfx"
           } else {
-            Write-Host "::warning::devcert.pfx not found and MSIX_PFX_BASE64 not set; build_windows.ps1 will generate a certificate"
+            # No secret cert: build_windows.ps1 generates an ephemeral
+            # certificate from the manifest. The repository never carries a
+            # signing key, so without the secret the package is signed with a
+            # throwaway cert that must not be trusted by end users.
+            Write-Host "::warning::MSIX_PFX_BASE64 not set; an ephemeral certificate will be generated for signing"
           }
 
       - name: Inject release metadata into manifest
@@ -403,18 +495,24 @@ jobs:
           Write-Host "::endgroup::"
           Write-Host "::notice::Unsigned package ready: $unsignedPath"
 
-      - name: Create 7z archives (every built architecture)
+      - name: Create portable zip archives (every built architecture)
         shell: pwsh
         run: |
           # One portable archive per Windows GUI architecture the build
           # scripts produced, so the release set matches the build matrix
           # (windows x64/x86/arm64) instead of x64 only.
+          #
+          # zip, not 7z: Windows has handled zip natively since before 10, so
+          # users can extract without installing anything and the in-app
+          # updater can unpack it with archive/zip.
           $ErrorActionPreference = 'Stop'
-          $guiRoot = Join-Path $env:GITHUB_WORKSPACE 'build/bin/gui/Windows'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $root = $env:GITHUB_WORKSPACE
+          $guiRoot = Join-Path $root 'build/bin/gui/Windows'
           $archFileNames = @{
-            'x64'   = 'snishaper-windows-amd64.7z'
-            'x86'   = 'snishaper-windows-386.7z'
-            'arm64' = 'snishaper-windows-arm64.7z'
+            'x64'   = 'snishaper-windows-amd64.zip'
+            'x86'   = 'snishaper-windows-386.zip'
+            'arm64' = 'snishaper-windows-arm64.zip'
           }
           $packed = @()
           foreach ($arch in @('x64', 'x86', 'arm64')) {
@@ -423,10 +521,12 @@ jobs:
               Write-Host "::warning::no Windows GUI payload for '$arch'; skipping its portable archive"
               continue
             }
-            $archive = $archFileNames[$arch]
-            Write-Host "::group::7z a $archive (windows/$arch)"
-            7z a -mx=9 $archive (Join-Path $dir '*')
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $archive = Join-Path $root $archFileNames[$arch]
+            if (Test-Path $archive) { Remove-Item $archive -Force }
+            Write-Host "::group::Compress-Archive $($archFileNames[$arch]) (windows/$arch)"
+            [System.IO.Compression.ZipFile]::CreateFromDirectory(
+              $dir, $archive,
+              [System.IO.Compression.CompressionLevel]::Optimal, $false)
             Write-Host "::endgroup::"
             $packed += $arch
           }
@@ -438,6 +538,8 @@ jobs:
 
       - name: Create cert install batch
         shell: pwsh
+        env:
+          MSIX_PFX_PASSWORD: ${{ secrets.MSIX_PFX_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
           $pkgDir = Join-Path $env:GITHUB_WORKSPACE 'build/bin/gui/Windows'
@@ -448,30 +550,44 @@ jobs:
             Write-Host "::error::no signed package found for install.bat"
             exit 1
           }
+          # Sideloading only needs the PUBLIC certificate to be trusted; the
+          # private key and its password must never ship in a release bundle.
+          # Export the .cer (public part) from the signing pfx and bundle
+          # only that.
+          $pfxPath = Join-Path $env:GITHUB_WORKSPACE 'devcert.pfx'
+          if (-not (Test-Path $pfxPath)) {
+            Write-Host "::error::signing certificate devcert.pfx not found; cannot export the public certificate for install.bat"
+            exit 1
+          }
           $password = if ($env:MSIX_PFX_PASSWORD) { $env:MSIX_PFX_PASSWORD } else { 'password' }
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfxPath, $password)
+          $cerPath = Join-Path $env:GITHUB_WORKSPACE 'devcert.cer'
+          [IO.File]::WriteAllBytes($cerPath, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
           $bat = @(
             '@echo off'
             'chcp 65001 > nul'
             'echo Installing certificate to Trusted Root Certification Authorities...'
-            "certutil -f -importpfx `"%~dp0devcert.pfx`" $password"
+            "certutil -addstore -f Root `"%~dp0devcert.cer`""
             'echo Installing MSIX package...'
             "powershell -Command `"Add-AppxPackage -Path '%~dp0$($msix.Name)'`""
             'echo Done!'
             'pause'
           )
           $bat -join "`r`n" | Set-Content -Path install.bat
-          Write-Host "::notice::install.bat created for $($msix.Name)"
+          Write-Host "::notice::install.bat created for $($msix.Name) (public certificate only)"
 
-      - name: Create signed bundle 7z
+      - name: Create signed bundle zip
         shell: pwsh
-        env:
-          MSIX_PFX_PASSWORD: ${{ secrets.MSIX_PFX_PASSWORD }}
         run: |
-          # Bundle the signed MSIX + cert + install.bat + signing password
-          # into one 7z named after the MSIX base name, so users get a
+          # Bundle the signed MSIX + public certificate (.cer) + install.bat
+          # into one zip named after the MSIX base name, so users get a
           # single self-contained archive
-          # (e.g. dongle.Snishaper_1.29.0.0_x64_x86_arm64.7z).
+          # (e.g. dongle.Snishaper_1.29.0.0_x64_x86_arm64.zip).
+          # The private key (devcert.pfx) and its password deliberately stay
+          # out: sideloading only needs the public certificate trusted.
           $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
           $root = $env:GITHUB_WORKSPACE
           $msix = Get-ChildItem -Path (Join-Path $root 'build/bin/gui/Windows') -File |
                   Where-Object { $_.Name -match '\.msix(bundle)?$' -and $_.Name -notlike 'unsigned_*' } |
@@ -480,21 +596,29 @@ jobs:
             Write-Host "::error::no signed package found for bundle"
             exit 1
           }
-          $bundleName = $msix.BaseName + '.7z'
+          $bundleName = $msix.BaseName + '.zip'
           $bundlePath = Join-Path $root $bundleName
           $installBat = Join-Path $root 'install.bat'
           if (-not (Test-Path $installBat)) {
             Write-Host "::error::install.bat not found"
             exit 1
           }
-          $password = if ($env:MSIX_PFX_PASSWORD) { $env:MSIX_PFX_PASSWORD } else { 'password' }
-          $passwordFile = Join-Path $root 'msix-signing-password.txt'
-          [IO.File]::WriteAllText($passwordFile, $password)
-          Write-Host "::group::7z a $bundleName (msix + devcert.pfx + install.bat + password)"
-          7z a -mx=9 $bundlePath $msix.FullName (Join-Path $root 'devcert.pfx') $installBat $passwordFile
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::7z bundle failed (exit $LASTEXITCODE)"
+          $cerPath = Join-Path $root 'devcert.cer'
+          if (-not (Test-Path $cerPath)) {
+            Write-Host "::error::devcert.cer not found; run the cert install batch step first"
             exit 1
+          }
+          if (Test-Path $bundlePath) { Remove-Item $bundlePath -Force }
+          Write-Host "::group::$bundleName (msix + devcert.cer + install.bat)"
+          $zip = [System.IO.Compression.ZipFile]::Open($bundlePath, 'Create')
+          try {
+            foreach ($file in @($msix, $cerPath, $installBat)) {
+              [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zip, $file, (Split-Path $file -Leaf),
+                [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+          } finally {
+            $zip.Dispose()
           }
           Write-Host "::endgroup::"
           Write-Host "::notice::Signed bundle ready: $bundlePath"
@@ -522,6 +646,23 @@ jobs:
           }
           Write-Host "::notice::Inno Setup installer created"
 
+      - name: Build Windows CLI (native)
+        shell: pwsh
+        run: |
+          # The three Windows CLI targets build on the same runner (pure Go,
+          # CGO off; x86/arm64 are same-OS builds, not slow cross toolchains).
+          $ErrorActionPreference = 'Stop'
+          Write-Host "::group::build_windows.ps1 -CI -Type cli -Platform windows -Arch x64,x86,arm64 -Silent"
+          ./build_windows.ps1 -CI -Type cli -Platform windows -Arch x64,x86,arm64 -Silent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "::endgroup::"
+          $v = & 'build\bin\cli\Windows\x64\snishaper.exe' version
+          Write-Host "::notice::CLI smoke version: $v"
+          if (-not $v) {
+            Write-Host "::error::CLI smoke version empty"
+            exit 1
+          }
+
       - name: Stage Windows artifacts
         shell: pwsh
         run: |
@@ -539,16 +680,16 @@ jobs:
             Write-Host "::error::no signed package found under $pkgDir"
             exit 1
           }
-          # The signed MSIX ships only inside the dongle.*.7z bundle (with
-          # devcert.pfx, install.bat and the signing password); staging it as
+          # The signed MSIX ships only inside the dongle.*.zip bundle (with
+          # devcert.cer and install.bat); staging it as
           # a loose file would make the verify step demand an upload that no
           # pattern provides. Only the unsigned Partner Center package is a
           # standalone asset.
           $unsigned = Get-ChildItem -Path $pkgDir -File -Filter 'unsigned_*' | Select-Object -First 1
           if ($unsigned) { Copy-Item $unsigned.FullName $assetsDir\ -ErrorAction Stop }
 
-          # Portable 7z: one per built Windows GUI architecture.
-          $portables = Get-ChildItem -Path $root -File -Filter 'snishaper-windows-*.7z' -ErrorAction SilentlyContinue
+          # Portable zip: one per built Windows GUI architecture.
+          $portables = Get-ChildItem -Path $root -File -Filter 'snishaper-windows-*.zip' -ErrorAction SilentlyContinue
           if (-not $portables) {
             Write-Host "::error::no Windows portable archive produced"
             exit 1
@@ -559,9 +700,9 @@ jobs:
           }
 
           # Signed MSIX bundle archive (named after the MSIX, contains
-          # devcert.pfx + install.bat + signing password).
-          $bundle = Get-ChildItem -Path $root -Filter '*_x64*.7z' -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -notlike 'snishaper-windows-*' } | Select-Object -First 1
+          # devcert.cer + install.bat).
+          $bundle = Get-ChildItem -Path $root -Filter 'dongle.*.zip' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
           if ($bundle) { Copy-Item $bundle.FullName $assetsDir\ -ErrorAction Stop }
 
           # Inno Setup installers: one per built architecture.
@@ -575,11 +716,70 @@ jobs:
             Write-Host "::notice::staged installer $($s.Name)"
           }
 
-          if (Test-Path (Join-Path $root 'devcert.pfx')) { Write-Host "::notice::devcert.pfx ships inside the dongle bundle only" }
+          # Bundled CLI archives: the same runner builds the three Windows
+          # CLI targets natively (pure Go, CGO off) instead of the old
+          # single-job cross-compile of all seven targets.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $cliTargets = @(
+            @{ dir = 'build\bin\cli\Windows\x64';   name = 'snishaper-cli-windows-amd64' }
+            @{ dir = 'build\bin\cli\Windows\x86';   name = 'snishaper-cli-windows-386' }
+            @{ dir = 'build\bin\cli\Windows\arm64'; name = 'snishaper-cli-windows-arm64' }
+          )
+          foreach ($t in $cliTargets) {
+            if (-not (Test-Path (Join-Path $t.dir 'snishaper.exe'))) {
+              Write-Host "::error::missing CLI output $($t.dir)\snishaper.exe"
+              exit 1
+            }
+            $archive = Join-Path $assetsDir "$($t.name).zip"
+            Write-Host "::group::packaging $($t.name).zip"
+            [System.IO.Compression.ZipFile]::CreateFromDirectory(
+              (Join-Path $root $t.dir), $archive,
+              [System.IO.Compression.CompressionLevel]::Optimal, $false)
+            Write-Host "::endgroup::"
+          }
+          & (Join-Path $cliTargets[0].dir 'snishaper.exe') version | ForEach-Object {
+            Write-Host "::notice::CLI smoke version: $_"
+          }
+
+          if (Test-Path (Join-Path $root 'devcert.cer')) { Write-Host "::notice::devcert.cer (public cert) ships inside the dongle bundle only" }
           if (Test-Path (Join-Path $root 'install.bat')) { Write-Host "::notice::install.bat ships inside the dongle bundle only" }
 
           Write-Host "Staged files:" -ForegroundColor Green
           Get-ChildItem $assetsDir | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
+
+      - name: Package updater bundles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/build-updater-bundle.ps1'
+          & $script `
+            -RepoRoot $env:GITHUB_WORKSPACE `
+            -Version "${{ needs.check.outputs.display_version }}" `
+            -Tag "${{ needs.check.outputs.tag }}" `
+            -Channel "${{ inputs.channel }}" `
+            -Repository "${{ github.repository }}" `
+            -AssetsDir (Join-Path $env:GITHUB_WORKSPACE 'staging')
+
+      - name: Sign updater manifests
+        if: env.UPDATER_SIGNING_READY == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assetsDir = Join-Path $env:GITHUB_WORKSPACE 'staging'
+          $pubOut = Join-Path $assetsDir 'updater-public-key.txt'
+          $manifests = @(Get-ChildItem -Path $assetsDir -File -Filter 'updater-manifest-*.json')
+          if ($manifests.Count -eq 0) {
+            Write-Host "::error::no updater manifests to sign"
+            exit 1
+          }
+          foreach ($m in $manifests) {
+            & go run ./updater/signmanifest -in $m.FullName -pub-out $pubOut
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::manifest signing failed for $($m.Name)"
+              exit 1
+            }
+          }
+          Write-Host "::notice::signed $($manifests.Count) updater manifest(s)"
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v7
@@ -587,6 +787,26 @@ jobs:
           name: windows-artifacts
           path: staging/
           retention-days: 3
+
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ci/build-summary.sh
+          .github/scripts/ci/build-summary.sh record \
+            --project SniShaper \
+            --target "GUI windows (MSIX + installers)" \
+            --tasks "frontend, gui, msix, inno" \
+            --runner windows-2025 \
+            --outcome "${{ job.status }}" \
+            --cache-hit "${{ steps.go.outputs.cache-hit }}" \
+            --row "Windows/x64=build/bin/gui/Windows/x64/snishaper.exe" \
+            --row "Windows/x86=build/bin/gui/Windows/x86/snishaper.exe" \
+            --row "Windows/arm64=build/bin/gui/Windows/arm64/snishaper.exe" \
+            --row "MSIX=build/bin/gui/Windows/*.msix" \
+            --row "CLI=snishaper-cli-windows-*.zip" \
+            --dir "staging"
 
   # ------------------------------------------------------------------
   # Linux build (ubuntu-26.04): portable tar.gz via build.sh.
@@ -613,9 +833,23 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Go
+        id: go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Cache Go build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/AppData/Local/go-build
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: go-build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ matrix.arch }}-
+            go-build-${{ runner.os }}-
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -624,10 +858,44 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: apt-${{ matrix.runner }}-v1
+          restore-keys: |
+            apt-${{ matrix.runner }}-
+
       - name: Install GTK4/WebKitGTK dependencies
+        timeout-minutes: 10
         run: |
+          set -euo pipefail
+          cache="${{ runner.temp }}/apt-archives"
+          mkdir -p "$cache"
+          if compgen -G "$cache/*.deb" > /dev/null; then
+            sudo cp -n "$cache"/*.deb /var/cache/apt/archives/ || true
+            echo "::notice::restored $(ls -1 "$cache"/*.deb | wc -l) cached .deb files"
+          fi
+          # The Azure archive mirror stalls on large packages (observed on
+          # libjavascriptcoregtk-6.0-1 on the arm64 runner); point apt at the
+          # default Ubuntu archive and fail fast instead of retrying a dead
+          # connection.
+          sudo tee /etc/apt/apt.conf.d/99-ci-timeout <<'EOF'
+          Acquire::Retries "0";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          DPkg::Lock::Timeout "120";
+          EOF
+          for f in /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources; do
+            if [ -f "$f" ]; then
+              sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' "$f"
+            fi
+          done
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            libgtk-4-dev libwebkitgtk-6.0-dev
+          cp -n /var/cache/apt/archives/*.deb "$cache"/ 2>/dev/null || true
+          echo "::notice::apt archive cache now holds $(ls -1 "$cache"/*.deb 2>/dev/null | wc -l) files"
 
       - name: Inject release metadata into manifest
         shell: pwsh
@@ -659,6 +927,26 @@ jobs:
             exit 1
           fi
 
+      - name: Build and package CLI (native)
+        run: |
+          set -euo pipefail
+          chmod +x build.sh
+          echo "::group::build.sh --ci --platform linux --arch ${{ matrix.arch }} --type cli"
+          ./build.sh --ci --platform linux --arch "${{ matrix.arch }}" --type cli 2>&1 | tee build-cli.log
+          echo "::endgroup::"
+          BIN="build/bin/cli/Linux/${{ matrix.arch }}/snishaper"
+          test -f "$BIN" || { echo "::error::$BIN missing"; exit 1; }
+          if grep -Eqi 'aarch64-linux-gnu|osxcross' build-cli.log; then
+            echo "::error::cross toolchain detected in a CI build"
+            exit 1
+          fi
+          GOARCH_NAME="${{ matrix.arch }}"
+          if [ "$GOARCH_NAME" = "x64" ]; then GOARCH_NAME="amd64"; fi
+          ARCHIVE="snishaper-cli-linux-${GOARCH_NAME}.tar.gz"
+          tar -czf "$ARCHIVE" -C "build/bin/cli/Linux/${{ matrix.arch }}" .
+          ls -lh "$ARCHIVE"
+          echo "::notice::$ARCHIVE ready"
+
       - name: Create tar.gz archive
         run: |
           set -euo pipefail
@@ -671,24 +959,49 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: linux-artifacts-${{ matrix.arch }}
-          path: snishaper-linux-${{ matrix.arch }}.tar.gz
+          path: |
+            snishaper-linux-${{ matrix.arch }}.tar.gz
+            snishaper-cli-linux-*.tar.gz
           retention-days: 3
 
+      - name: Write build summary
+        if: always()
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ci/build-summary.sh
+          .github/scripts/ci/build-summary.sh record \
+            --project SniShaper \
+            --target "GUI linux/${{ matrix.arch }}" \
+            --tasks "frontend, gui, tar.gz, cli tar.gz" \
+            --runner "${{ matrix.runner }}" \
+            --outcome "${{ job.status }}" \
+            --cache-hit "${{ steps.go.outputs.cache-hit }}" \
+            --row "linux/${{ matrix.arch }}=build/bin/gui/Linux/${{ matrix.arch }}/SniShaper" \
+            --row "tar.gz=snishaper-linux-${{ matrix.arch }}.tar.gz" \
+            --row "cli=snishaper-cli-linux-*.tar.gz"
+
   # ------------------------------------------------------------------
-  # CLI build (windows-2025): cross-compile the headless CLI for all six
-  # targets (windows/linux/darwin x amd64/arm64) and package each target
-  # into its own 7z archive (binary + config/ + rules/ seed files).
+  # The CLI archives no longer have their own cross-compile job: each
+  # platform job above packages the CLI for its own platform natively
+  # (windows-2025 -> snishaper-cli-windows-*, ubuntu -> snishaper-cli-linux-*,
+  # macos -> snishaper-cli-darwin-*), which is faster than cross-compiling
+  # all seven targets on a single runner.
   # ------------------------------------------------------------------
-  build-cli:
-    name: Build CLI (${{ inputs.channel }})
+  build-macos:
+    name: Build macOS/${{ matrix.arch }} (${{ inputs.channel }})
     needs: check
     if: needs.check.outputs.skip != 'true'
-    runs-on: windows-2025
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-    env:
-      DISPLAY_VERSION: ${{ needs.check.outputs.display_version }}
-      RELEASE_CHANNEL: ${{ inputs.channel }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26-intel
+            arch: x64
+          - runner: macos-26
+            arch: arm64
     steps:
       - name: Checkout full history
         uses: actions/checkout@v7
@@ -696,12 +1009,23 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Go
+        id: go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+          cache-dependency-path: go.sum
 
-      - name: Install 7-Zip
-        run: choco install 7zip -y --no-progress
+      - name: Cache Go build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/AppData/Local/go-build
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: go-build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ matrix.arch }}-
+            go-build-${{ runner.os }}-
 
       - name: Inject release metadata into manifest
         shell: pwsh
@@ -718,65 +1042,231 @@ jobs:
             -IdentityVersion "${{ needs.check.outputs.identity_version }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Build and package CLI (7 targets, one 7z each)
-        shell: pwsh
+      - name: Build CLI (build.sh --ci)
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "::group::build_windows.ps1 -CI -Type cli -All -Silent"
-          ./build_windows.ps1 -CI -Type cli -All -Silent
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "::endgroup::"
-          $targets = @(
-            @{ dir = 'build\bin\cli\Windows\x64';   name = 'snishaper-cli-windows-amd64' }
-            @{ dir = 'build\bin\cli\Windows\x86';   name = 'snishaper-cli-windows-386' }
-            @{ dir = 'build\bin\cli\Windows\arm64'; name = 'snishaper-cli-windows-arm64' }
-            @{ dir = 'build\bin\cli\Linux\x64';     name = 'snishaper-cli-linux-amd64' }
-            @{ dir = 'build\bin\cli\Linux\arm64';   name = 'snishaper-cli-linux-arm64' }
-            @{ dir = 'build\bin\cli\Darwin\x64';    name = 'snishaper-cli-darwin-amd64' }
-            @{ dir = 'build\bin\cli\Darwin\arm64';  name = 'snishaper-cli-darwin-arm64' }
-          )
-          foreach ($t in $targets) {
-            if (-not (Test-Path $t.dir)) {
-              Write-Host "::error::missing CLI output directory $($t.dir)"
-              exit 1
-            }
-            $archive = "$($t.name).7z"
-            Write-Host "::group::packaging $archive"
-            7z a -mx=9 $archive (Join-Path $t.dir '*')
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            Write-Host "::endgroup::"
-          }
-
-      - name: Smoke test CLI binary
-        shell: pwsh
-        env:
-          DISPLAY_VERSION: ${{ needs.check.outputs.display_version }}
-          RELEASE_CHANNEL: ${{ inputs.channel }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $LDFLAGS = "-s -w -X snishaper/app.buildVersion=$env:DISPLAY_VERSION"
-          if ($env:RELEASE_CHANNEL -and $env:RELEASE_CHANNEL -ne 'release') {
-            $LDFLAGS += " -X snishaper/app.buildChannel=$env:RELEASE_CHANNEL"
-          }
-          $env:GOOS = 'windows'; $env:GOARCH = 'amd64'; $env:CGO_ENABLED = '0'
-          go build -tags "with_gvisor headless" -ldflags="$LDFLAGS" -o cli-smoke.exe ./cli
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $v = .\cli-smoke.exe version
-          Write-Host "::notice::CLI smoke version: $v (expected $env:DISPLAY_VERSION)"
-          if ($v.Trim() -ne $env:DISPLAY_VERSION.Trim()) {
-            Write-Host "::error::CLI smoke version mismatch: got '$v', expected '$env:DISPLAY_VERSION'"
+          set -o pipefail
+          chmod +x build.sh
+          ./build.sh --ci --platform darwin --arch "${{ matrix.arch }}" --type cli 2>&1 | tee build.log
+          if grep -Eqi 'aarch64-linux-gnu|osxcross' build.log; then
+            echo "::error::cross toolchain detected in a CI build"
             exit 1
-          }
-          .\cli-smoke.exe help | Out-Null
-          Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
-          Remove-Item -Force cli-smoke.exe
+          fi
 
-      - name: Upload CLI artifacts
+      - name: Bundle SniShaper.app (ad-hoc signed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x macos/scripts/bundle-app.sh
+          # --cli reuses the binary built above; bundle-app.sh would
+          # otherwise rebuild it via build.sh.
+          macos/scripts/bundle-app.sh --cli "$PWD/build/bin/cli/Darwin/${{ matrix.arch }}/snishaper"
+          APP="build/bin/macos/SniShaper.app"
+          test -x "$APP/Contents/MacOS/SnishaperBar"
+          test -x "$APP/Contents/Resources/bin/snishaper"
+          test -f "$APP/Contents/Info.plist"
+          test -f "build/bin/macos/SniShaper-macos-$(uname -m).zip"
+          echo "::notice::bundled and ad-hoc signed SniShaper.app ($(uname -m))"
+
+      - name: Package CLI archive (zip)
+        shell: bash
+        run: |
+          # The CLI binary was already built above (bundle-app.sh --cli
+          # reuses it); pack the same payload the old cross-compile job
+          # shipped: binary + config/ + rules/ seed files.
+          set -euo pipefail
+          GOARCH_NAME="${{ matrix.arch }}"
+          if [ "$GOARCH_NAME" = "x64" ]; then GOARCH_NAME="amd64"; fi
+          ARCHIVE="snishaper-cli-darwin-${GOARCH_NAME}.zip"
+          ARCHIVE_PATH="$(pwd)/$ARCHIVE"
+          rm -f "$ARCHIVE_PATH"
+          # zip keeps the Unix mode bits, so the packed ./snishaper stays
+          # executable after extraction.
+          (cd "build/bin/cli/Darwin/${{ matrix.arch }}" && zip -q -r -9 "$ARCHIVE_PATH" .)
+          ls -lh "$ARCHIVE"
+          echo "::notice::$ARCHIVE ready"
+
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: cli-artifacts
-          path: snishaper-cli-*.7z
+          name: macos-artifacts-${{ matrix.arch }}
+          path: |
+            build/bin/macos/SniShaper-macos-*.zip
+            snishaper-cli-darwin-*.zip
           retention-days: 3
+
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ci/build-summary.sh
+          .github/scripts/ci/build-summary.sh record \
+            --project SniShaper \
+            --target "CLI darwin/${{ matrix.arch }}" \
+            --tasks "cli, SnishaperBar app bundle" \
+            --runner "${{ matrix.runner }}" \
+            --outcome "${{ job.status }}" \
+            --cache-hit "${{ steps.go.outputs.cache-hit }}" \
+            --row "darwin/${{ matrix.arch }}=build/bin/cli/Darwin/${{ matrix.arch }}/snishaper" \
+            --row "SniShaper.app zip=build/bin/macos/SniShaper-macos-*.zip" \
+            --row "cli zip=snishaper-cli-darwin-*.zip"
+
+  # ------------------------------------------------------------------
+  # Linux distribution packages (.deb / .rpm / AppImage) for each arch,
+  # using the same packaging scripts as the manual linux-packages.yml
+  # workflow. Uploaded to the release alongside the plain tar.gz
+  # archives. AppImage is best-effort (build-packages.sh warns and
+  # continues); deb/rpm are hard requirements.
+  # ------------------------------------------------------------------
+  build-linux-packages:
+    name: Build Linux packages/${{ matrix.arch }} (${{ inputs.channel }})
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-26.04
+            arch: amd64
+            path_arch: x64
+          - runner: ubuntu-26.04-arm
+            arch: arm64
+            path_arch: arm64
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        id: go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Cache Go build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/AppData/Local/go-build
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+          key: go-build-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ runner.os }}-${{ matrix.arch }}-
+            go-build-${{ runner.os }}-
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Cache apt packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: apt-${{ runner.os }}-v1
+          restore-keys: |
+            apt-${{ runner.os }}-
+
+      - name: Install GTK4/WebKitGTK dependencies
+        run: |
+          set -euo pipefail
+          cache="${{ runner.temp }}/apt-archives"
+          mkdir -p "$cache"
+          if compgen -G "$cache/*.deb" > /dev/null; then
+            sudo cp -n "$cache"/*.deb /var/cache/apt/archives/ || true
+            echo "::notice::restored $(ls -1 "$cache"/*.deb | wc -l) cached .deb files"
+          fi
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libwebkitgtk-6.0-dev
+          cp -n /var/cache/apt/archives/*.deb "$cache"/ 2>/dev/null || true
+          echo "::notice::apt archive cache now holds $(ls -1 "$cache"/*.deb 2>/dev/null | wc -l) files"
+
+      - name: Inject release metadata into manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/inject-manifest-release.ps1'
+          if (-not (Test-Path $script)) {
+            Write-Host "::error::inject-manifest-release.ps1 missing: $script"
+            exit 1
+          }
+          & $script -RepoRoot $env:GITHUB_WORKSPACE `
+            -ReleaseVersion "${{ needs.check.outputs.version }}" `
+            -ReleaseChannel "${{ needs.check.outputs.rel_channel }}" `
+            -IdentityVersion "${{ needs.check.outputs.identity_version }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Fetch linuxdeploy
+        run: |
+          chmod +x packaging/fetch-linuxdeploy.sh
+          ./packaging/fetch-linuxdeploy.sh "${{ matrix.arch }}"
+
+      - name: Build CLI + GUI
+        run: |
+          set -o pipefail
+          chmod +x build.sh
+          ./build.sh --ci --platform linux --arch "${{ matrix.path_arch }}" --type cli --type gui --install-deps 2>&1 | tee build.log
+          if grep -Eqi 'aarch64-linux-gnu|osxcross' build.log; then
+            echo "::error::cross toolchain detected in a CI build"
+            exit 1
+          fi
+
+      - name: Build packages
+        run: |
+          set -euo pipefail
+          chmod +x packaging/build-packages.sh
+          ./packaging/build-packages.sh "${{ matrix.arch }}" "${{ needs.check.outputs.version }}"
+
+      - name: Verify packages
+        run: |
+          set -euo pipefail
+          out="build/dist/linux/${{ matrix.arch }}"
+          ls -l "$out"
+          for f in \
+            "$out/snishaper_${{ needs.check.outputs.version }}_${{ matrix.arch }}.deb" \
+            "$out/snishaper-${{ needs.check.outputs.version }}_${{ matrix.arch }}.rpm"; do
+            if [ ! -f "$f" ]; then echo "::error::missing $f"; exit 1; fi
+          done
+          # deb must carry the desktop entry, the icon and both binaries
+          dpkg-deb -c "$out/snishaper_${{ needs.check.outputs.version }}_${{ matrix.arch }}.deb" | tee deb.list
+          for want in usr/bin/SniShaper usr/bin/snishaper usr/share/applications/snishaper.desktop usr/share/icons/hicolor/512x512/apps/snishaper.png; do
+            grep -q "$want" deb.list || { echo "::error::deb missing $want"; exit 1; }
+          done
+
+      - name: Upload Linux package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-packages-${{ matrix.arch }}
+          path: build/dist/linux/${{ matrix.arch }}/
+          retention-days: 3
+
+      - name: Write build summary
+        if: always()
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ci/build-summary.sh
+          .github/scripts/ci/build-summary.sh record \
+            --project SniShaper \
+            --target "Packages linux/${{ matrix.arch }}" \
+            --tasks "cli, gui, deb, rpm, appimage" \
+            --runner "${{ matrix.runner }}" \
+            --outcome "${{ job.status }}" \
+            --cache-hit "${{ steps.go.outputs.cache-hit }}" \
+            --row "deb=build/dist/linux/${{ matrix.arch }}/*.deb" \
+            --row "rpm=build/dist/linux/${{ matrix.arch }}/*.rpm" \
+            --row "AppImage=build/dist/linux/${{ matrix.arch }}/*.AppImage"
 
   # ------------------------------------------------------------------
   # Publish (windows-2025): merge artifacts from all platforms, generate
@@ -784,7 +1274,7 @@ jobs:
   # ------------------------------------------------------------------
   publish:
     name: Publish Release (${{ inputs.channel }})
-    needs: [check, build-windows, build-linux, build-cli]
+    needs: [check, build-windows, build-linux, build-macos, build-linux-packages]
     if: needs.check.outputs.skip != 'true'
     runs-on: windows-2025
     permissions:
@@ -792,6 +1282,9 @@ jobs:
     env:
       LLM_CONFIGURED: ${{ secrets.LLM_API_KEY != '' }}
       RELEASE_BOT_READY: ${{ secrets.RELEASE_BOT_APP_ID != '' && secrets.RELEASE_BOT_PRIVATE_KEY != '' }}
+      ANNOUNCEMENT_READY: ${{ secrets.ANNOUNCEMENT_ADMIN_EMAIL != '' && secrets.ANNOUNCEMENT_ADMIN_PASSWORD != '' }}
+      ANNOUNCEMENT_ADMIN_EMAIL: ${{ secrets.ANNOUNCEMENT_ADMIN_EMAIL }}
+      ANNOUNCEMENT_ADMIN_PASSWORD: ${{ secrets.ANNOUNCEMENT_ADMIN_PASSWORD }}
     steps:
       - name: Generate release bot token
         id: bot
@@ -821,11 +1314,19 @@ jobs:
           path: staging
           merge-multiple: true
 
-      - name: Download CLI artifacts
+      - name: Download macOS artifacts (every architecture)
         uses: actions/download-artifact@v8
         with:
-          name: cli-artifacts
+          pattern: macos-artifacts-*
           path: staging
+          merge-multiple: true
+
+      - name: Download Linux package artifacts (every architecture)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: linux-packages-*
+          path: staging
+          merge-multiple: true
 
       - name: Determine previous release tag
         id: prev-tag
@@ -1031,8 +1532,8 @@ jobs:
           # hard-coded to a single architecture.
           function Get-AssetPurpose([string]$name) {
             switch -Regex ($name) {
-                '^dongle\.Snishaper_.*\.7z$' {
-                    return 'Signed bundle: mixed-architecture MSIX package + signing certificate (devcert.pfx) + install.bat + signing password, for one-click sideload'
+                '^dongle\.Snishaper_.*\.zip$' {
+                    return 'Signed bundle: mixed-architecture MSIX package + public signing certificate (devcert.cer) + install.bat, for one-click sideload'
                 }
                 '^unsigned_.*\.msix(bundle)?$' {
                     return 'Unsigned mixed-architecture MSIX package for Microsoft Partner Center submission (re-signed by Microsoft on upload)'
@@ -1042,17 +1543,17 @@ jobs:
                     $label = switch ($a) { 'x64' { 'x64' } 'x86' { 'x86 (32-bit)' } '386' { 'x86 (32-bit)' } 'arm64' { 'ARM64' } default { $a } }
                     return "Windows installer (Inno Setup, $label): classic guided installation with license and desktop shortcut, for regular users"
                 }
-                '^snishaper-windows-(amd64|386|arm64)\.7z$' {
+                '^snishaper-windows-(amd64|386|arm64)\.zip$' {
                     $a = $Matches[1]
                     $label = switch ($a) { 'amd64' { 'x64' } '386' { 'x86 (32-bit)' } 'arm64' { 'ARM64' } default { $a } }
-                    return "Windows portable build ($label): extract and run snishaper.exe directly, no installation required"
+                    return "Windows portable build ($label), zip: extract with the built-in Windows extractor and run snishaper.exe, no installation required; ships the portable updater and its config for in-app updates"
                 }
                 '^snishaper-linux-(amd64|arm64|x64)\.tar\.gz$' {
                     $a = $Matches[1]
                     $label = if ($a -eq 'amd64') { 'amd64' } elseif ($a -eq 'x64') { 'x64' } else { 'ARM64' }
                     return "Linux portable build ($label): extract and run ./SniShaper, requires GTK4/WebKitGTK runtime"
                 }
-                '^snishaper-cli-(windows|linux|darwin)-(amd64|arm64|386)\.7z$' {
+                '^snishaper-cli-(windows|linux|darwin)-(amd64|arm64|386)\.(zip|tar\.gz)$' {
                     $os = $Matches[1]
                     $a = $Matches[2]
                     $osLabel = switch ($os) { 'windows' { 'Windows' } 'linux' { 'Linux' } 'darwin' { 'macOS' } default { $os } }
@@ -1060,19 +1561,65 @@ jobs:
                     $exe = if ($os -eq 'windows') { 'snishaper.exe' } else { './snishaper' }
                     return "CLI (headless): $osLabel $archLabel, extract and run $exe, includes config/ and rules/ seed files"
                 }
+                '^SniShaper-macos-(x86_64|arm64)\.zip$' {
+                    $a = $Matches[1]
+                    $label = if ($a -eq 'x86_64') { 'Intel' } else { 'Apple Silicon' }
+                    return "macOS menu bar app ($label): SniShaper.app with SnishaperBar + headless CLI, ad-hoc signed but not notarized - first launch needs a Gatekeeper allow (see docs/macos-app.md)"
+                }
+                '^snishaper_.*_(amd64|arm64)\.deb$' {
+                    $a = $Matches[1]
+                    $label = if ($a -eq 'amd64') { 'amd64' } else { 'ARM64' }
+                    return "Linux Debian package ($label): installs GUI + CLI with desktop entry (deb)"
+                }
+                '^snishaper-.*_(amd64|arm64)\.rpm$' {
+                    $a = $Matches[1]
+                    $label = if ($a -eq 'amd64') { 'amd64' } else { 'ARM64' }
+                    return "Linux RPM package ($label): installs GUI + CLI with desktop entry (rpm)"
+                }
+                '^SniShaper-.*-(amd64|arm64)\.AppImage$' {
+                    $a = $Matches[1]
+                    $label = if ($a -eq 'amd64') { 'amd64' } else { 'ARM64' }
+                    return "Linux AppImage ($label): self-contained GUI, download, chmod +x and run"
+                }
+                '^SniShaperUpdater-.*-(x64|x86|arm64)\.exe$' {
+                    return 'Portable auto-updater (native Win32, no runtime or shell dependencies): downloads, verifies and launches the Inno Setup installer in normal interactive mode'
+                }
+                '^snishaper-.*-windows-(x64|x86|arm64)-update\.zip$' {
+                    return 'Updater bundle: Inno Setup installer plus portable updater, consumed by SniShaperUpdater.exe'
+                }
+                '^updater-manifest-.*\.json$' {
+                    return 'Updater manifest: version, SHA-256 digests and download URL for the matching architecture'
+                }
+                '^updater-manifest-.*\.json\.sig$' {
+                    return 'Ed25519 signature over the corresponding updater manifest'
+                }
+                '^updater-public-key\.txt$' {
+                    return 'Base64 Ed25519 public key for verifying updater manifests (set as public_key in updater.json)'
+                }
                 default { return 'Release artifact' }
             }
           }
 
           # Fixed order: installers, signed bundle, unsigned MSIX, Windows
-          # portables, Linux portables, then every CLI target by name.
+          # portables, Linux portables, CLI archives, macOS app zips, then
+          # the Linux distribution packages by name.
           $ordered = @()
           $ordered += Get-ChildItem -Path $assetsDir -File -Filter '*Setup.exe' -ErrorAction SilentlyContinue
-          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'dongle.*.7z' -ErrorAction SilentlyContinue
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'dongle.*.zip' -ErrorAction SilentlyContinue
           $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'unsigned_*.msix*' -ErrorAction SilentlyContinue
-          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper-windows-*.7z' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper-windows-*.zip' -ErrorAction SilentlyContinue | Sort-Object Name
           $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper-linux-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object Name
-          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper-cli-*.7z' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper-cli-*.zip' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper-cli-*.tar.gz' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'SniShaper-macos-*.zip' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper_*.deb' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper-*.rpm' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'SniShaper-*.AppImage' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'SniShaperUpdater-*.exe' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'snishaper-*-windows-*-update.zip' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'updater-manifest-*.json' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'updater-manifest-*.json.sig' -ErrorAction SilentlyContinue | Sort-Object Name
+          $ordered += Get-ChildItem -Path $assetsDir -File -Filter 'updater-public-key.txt' -ErrorAction SilentlyContinue
 
           $listed = @{}
           foreach ($file in $ordered) {
@@ -1125,17 +1672,26 @@ jobs:
           Write-Host "::group::gh release create $tag"
           # Glob patterns (not literal paths) so every architecture the build
           # jobs produced is attached: all Setup exes, all Windows portable
-          # 7z, all Linux tar.gz, all CLI 7z, plus the signed MSIX bundle
-          # archive and the unsigned Partner Center package. The signed MSIX
-          # itself ships inside the dongle.*.7z archive together with
-          # devcert.pfx, install.bat and the signing password.
+          # zips, all Linux tar.gz, all CLI zips/tarballs, plus the signed
+          # MSIX bundle archive and the unsigned Partner Center package. The
+          # signed MSIX itself ships inside the dongle.*.zip archive together
+          # with devcert.cer (public cert) and install.bat.
           $patterns = @(
             (Join-Path $assetsDir 'unsigned_*.msix*'),
             (Join-Path $assetsDir '*Setup.exe'),
-            (Join-Path $assetsDir 'dongle.*.7z'),
-            (Join-Path $assetsDir 'snishaper-windows-*.7z'),
+            (Join-Path $assetsDir 'dongle.*.zip'),
+            (Join-Path $assetsDir 'snishaper-windows-*.zip'),
             (Join-Path $assetsDir 'snishaper-linux-*.tar.gz'),
-            (Join-Path $assetsDir 'snishaper-cli-*.7z')
+            (Join-Path $assetsDir 'snishaper-cli-*.zip'),
+            (Join-Path $assetsDir 'snishaper-cli-*.tar.gz'),
+            (Join-Path $assetsDir 'SniShaper-macos-*.zip'),
+            (Join-Path $assetsDir 'snishaper_*.deb'),
+            (Join-Path $assetsDir 'snishaper-*.rpm'),
+            (Join-Path $assetsDir 'SniShaper-*.AppImage'),
+            (Join-Path $assetsDir 'SniShaperUpdater-*.exe'),
+            (Join-Path $assetsDir 'snishaper-*-windows-*-update.zip'),
+            (Join-Path $assetsDir 'updater-manifest-*.json*'),
+            (Join-Path $assetsDir 'updater-public-key.txt')
           )
           $matched = @()
           foreach ($pattern in $patterns) {
@@ -1252,3 +1808,73 @@ jobs:
           }
           Write-Host "::endgroup::"
           Write-Host "::notice::Contributor section taken from GitHub generated notes"
+
+      - name: Publish release announcement
+        if: env.ANNOUNCEMENT_READY == 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://jetcpp.ccwu.cc'
+          $tag = "${{ needs.check.outputs.tag }}"
+          $displayVersion = "${{ needs.check.outputs.display_version }}"
+          $repo = "${{ github.repository }}"
+          $prerelease = "${{ inputs.prerelease }}".ToLowerInvariant()
+          $link = "https://github.com/$repo/releases/tag/$tag"
+          $notesPath = Join-Path $env:GITHUB_WORKSPACE 'staging\RELEASE_NOTES.md'
+          $changes = ''
+          if (Test-Path $notesPath) {
+            $notes = Get-Content -LiteralPath $notesPath -Raw
+            $match = [regex]::Match($notes, '(?s)##\s*Changes\s*\r?\n(.*?)(?=\r?\n##\s|\z)')
+            if ($match.Success) { $changes = $match.Groups[1].Value.Trim() }
+            if (-not $changes) { $changes = $notes.Trim() }
+          }
+          if ($changes.Length -gt 1600) { $changes = $changes.Substring(0, 1600).TrimEnd() + '...' }
+          if (-not $changes) { $changes = "SniShaper v$displayVersion" }
+          $level = if ($prerelease -eq 'true') { 'info' } else { 'important' }
+          $loginJson = @{ email = $env:ANNOUNCEMENT_ADMIN_EMAIL; password = $env:ANNOUNCEMENT_ADMIN_PASSWORD } | ConvertTo-Json -Compress
+          $login = Invoke-RestMethod -Method Post -Uri "$base/api/admin/session" -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($loginJson)) -TimeoutSec 30
+          if (-not $login.admin -or -not $login.token) { throw 'admin login failed' }
+          $notice = [ordered]@{
+            id = "release-$tag"
+            title = "SniShaper v$displayVersion 发布"
+            title_en = "SniShaper v$displayVersion released"
+            title_ru = "Выпущен SniShaper v$displayVersion"
+            body = "本次更新内容：`n$changes`n`n完整更新日志与下载资产见本次发版页面：$link"
+            body_en = "What's new in this release:`n$changes`n`nFull release notes and downloadable assets: $link"
+            body_ru = "Что нового в этом выпуске:`n$changes`n`nПолные примечания и файлы выпуска: $link"
+            level = $level
+            published_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            link = $link
+            link_text = '查看本次发版说明'
+            pinned = $false
+          }
+          $noticeJson = $notice | ConvertTo-Json -Depth 6
+          $response = Invoke-RestMethod -Method Post -Uri "$base/api/notices" -Headers @{ Authorization = "Bearer $($login.token)" } -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($noticeJson)) -TimeoutSec 30
+          if (-not $response.ok) { throw 'announcement publish failed' }
+          Write-Host "::notice::announcement published for $tag (id release-$tag, link $link)"
+
+  # ------------------------------------------------------------------
+  # Run-level build summary (Android-CI style job summary): one overview
+  # table of every build job plus the run artifacts and caches. Purely
+  # informational — never gates the release.
+  # ------------------------------------------------------------------
+  summary:
+    name: Build summary
+    needs: [check, build-windows, build-linux, build-macos, build-linux-packages, publish]
+    if: always() && !cancelled()
+    runs-on: ubuntu-26.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Write run summary
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/ci/build-summary.sh
+          .github/scripts/ci/build-summary.sh report --title "SniShaper Release Summary (${{ inputs.channel }})"
